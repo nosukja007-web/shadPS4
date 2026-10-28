@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -192,6 +193,43 @@ Instance::~Instance() {
     vmaDestroyAllocator(allocator);
 }
 
+void Instance::ReportDeviceFault() const {
+    static std::atomic_flag reported{};
+    if (reported.test_and_set()) {
+        return;
+    }
+    if (!device_fault) {
+        LOG_CRITICAL(Render_Vulkan, "Device lost; VK_EXT_device_fault unavailable");
+        return;
+    }
+    const auto dev = GetDevice();
+    vk::DeviceFaultCountsEXT counts{};
+    if (dev.getFaultInfoEXT(&counts, nullptr) != vk::Result::eSuccess &&
+        counts.addressInfoCount == 0 && counts.vendorInfoCount == 0) {
+        LOG_CRITICAL(Render_Vulkan, "Device lost; failed to query fault counts");
+        return;
+    }
+    std::vector<vk::DeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+    std::vector<vk::DeviceFaultVendorInfoEXT> vendor_infos(counts.vendorInfoCount);
+    counts.vendorBinarySize = 0;
+    vk::DeviceFaultInfoEXT info{
+        .pAddressInfos = addresses.data(),
+        .pVendorInfos = vendor_infos.data(),
+    };
+    const auto result = dev.getFaultInfoEXT(&counts, &info);
+    LOG_CRITICAL(Render_Vulkan, "Device fault ({}): {}", vk::to_string(result),
+                 std::string_view{info.description.data()});
+    for (const auto& addr : addresses) {
+        LOG_CRITICAL(Render_Vulkan, "  address {:#x} (precision {:#x}) type {}",
+                     addr.reportedAddress, addr.addressPrecision, vk::to_string(addr.addressType));
+    }
+    for (const auto& vendor : vendor_infos) {
+        LOG_CRITICAL(Render_Vulkan, "  vendor fault code {:#x} data {:#x}: {}",
+                     vendor.vendorFaultCode, vendor.vendorFaultData,
+                     std::string_view{vendor.description.data()});
+    }
+}
+
 std::string Instance::GetDriverVersionName() {
     // Extracted from
     // https://github.com/SaschaWillems/vulkan.gpuinfo.org/blob/5dddea46ea1120b0df14eef8f15ff8e318e35462/functions.php#L308-L314
@@ -220,7 +258,8 @@ bool Instance::CreateDevice() {
         vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT,
         vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
         vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
-        vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR>();
+        vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
+        vk::PhysicalDeviceFaultFeaturesEXT>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -238,7 +277,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    boost::container::static_vector<const char*, 40> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -364,6 +403,8 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "- shaderSubgroupClock: {}",
                  shader_clock_features.shaderSubgroupClock);
     }
+    device_fault = feature_chain.get<vk::PhysicalDeviceFaultFeaturesEXT>().deviceFault &&
+                   add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
 
@@ -544,6 +585,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderClockFeaturesKHR{
             .shaderSubgroupClock = shader_clock_features.shaderSubgroupClock,
         },
+        vk::PhysicalDeviceFaultFeaturesEXT{
+            .deviceFault = true,
+        },
     };
 
     if (!custom_border_color) {
@@ -597,6 +641,9 @@ bool Instance::CreateDevice() {
     }
     if (!shader_clock) {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
+    }
+    if (!device_fault) {
+        device_chain.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
     }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());

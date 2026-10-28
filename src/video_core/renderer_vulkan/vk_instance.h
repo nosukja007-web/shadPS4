@@ -280,6 +280,9 @@ public:
         return shader_clock && shader_clock_features.shaderSubgroupClock;
     }
 
+    /// Logs VK_EXT_device_fault information after a device loss, if available.
+    void ReportDeviceFault() const;
+
     /// Returns the vendor ID of the physical device
     u32 GetVendorID() const {
         return properties.vendorID;
@@ -548,6 +551,7 @@ private:
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
     bool shader_clock{};
+    bool device_fault{};
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};

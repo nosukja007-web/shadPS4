@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <magic_enum/magic_enum.hpp>
 #include <xxhash.h>
 
@@ -542,7 +543,13 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     std::vector<vk::SparseBufferMemoryBindInfo> buffer_binds;
     buffer_binds.reserve(pending_binds.size());
 
+    u64 num_binds{};
+    u64 bind_bytes{};
     for (const auto& binds : pending_binds) {
+        num_binds += binds.binds.size();
+        for (const auto& bind : binds.binds) {
+            bind_bytes += bind.size;
+        }
         buffer_binds.emplace_back(vk::SparseBufferMemoryBindInfo{
             .buffer = binds.arena->Handle(),
             .bindCount = static_cast<u32>(binds.binds.size()),
@@ -566,9 +573,35 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
         .pSignalSemaphores = &signal_sema,
     };
 
-    info.AddWait(signal_sema, signal_tick);
+    LOG_INFO(Render, "Sparse bind tick={} arenas={} binds={} bytes={:#x}", signal_tick,
+             buffer_binds.size(), num_binds, bind_bytes);
+
     auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
+    if (submit_result == vk::Result::eErrorDeviceLost) {
+        instance.ReportDeviceFault();
+    }
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+
+    // Diagnostic/workaround: wait for the bind on the host instead of making the next
+    // submission wait for it on the GPU.
+    static const bool host_wait = std::getenv("SHADPS4_SPARSE_HOST_WAIT") != nullptr;
+    if (host_wait) {
+        const vk::SemaphoreWaitInfo wait_info = {
+            .semaphoreCount = 1,
+            .pSemaphores = &signal_sema,
+            .pValues = &signal_tick,
+        };
+        constexpr u64 HostWaitTimeoutNs = 5'000'000'000ULL;
+        const auto wait_result = instance.GetDevice().waitSemaphores(&wait_info, HostWaitTimeoutNs);
+        if (wait_result == vk::Result::eErrorDeviceLost) {
+            instance.ReportDeviceFault();
+        }
+        ASSERT_MSG(wait_result == vk::Result::eSuccess,
+                   "Sparse bind tick={} did not complete on host wait: {}", signal_tick,
+                   vk::to_string(wait_result));
+    } else {
+        info.AddWait(signal_sema, signal_tick);
+    }
 
     pending_binds.clear();
 }
