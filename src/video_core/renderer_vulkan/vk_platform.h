@@ -9,6 +9,7 @@
 #include "common/logging/log.h"
 #include "common/string_literal.h"
 #include "common/types.h"
+#include "video_core/renderer_vulkan/vk_address_tracker.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
 namespace Frontend {
@@ -37,6 +38,7 @@ void SetObjectName(vk::Device device, const HandleType& handle, std::string_view
         .objectHandle = reinterpret_cast<u64>(static_cast<typename HandleType::NativeType>(handle)),
         .pObjectName = debug_name.data(),
     };
+    AddressTracker::RecordName(HandleType::objectType, name_info.objectHandle, debug_name);
     auto result = device.setDebugUtilsObjectNameEXT(name_info);
     if (result != vk::Result::eSuccess) {
         LOG_DEBUG(Render_Vulkan, "Could not set object debug name: {}", vk::to_string(result));

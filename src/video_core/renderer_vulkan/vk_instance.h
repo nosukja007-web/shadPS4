@@ -516,6 +516,7 @@ private:
     vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock_features;
     vk::DriverIdKHR driver_id;
     vk::UniqueDebugUtilsMessengerEXT debug_callback{};
+    vk::UniqueDebugUtilsMessengerEXT address_messenger{};
     std::string vendor_name;
     VmaAllocator allocator{};
     vk::Queue present_queue;
@@ -552,6 +553,7 @@ private:
     bool image_view_min_lod{};
     bool shader_clock{};
     bool device_fault{};
+    bool address_binding_report{};
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};

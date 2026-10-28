@@ -13,6 +13,7 @@
 #include "sdl_window.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_address_tracker.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
@@ -103,6 +104,7 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
     if (enable_validation) {
         debug_callback = CreateDebugCallback(*instance);
     }
+    address_messenger = AddressTracker::CreateMessenger(*instance);
     const std::size_t num_physical_devices = static_cast<u16>(physical_devices.size());
     ASSERT_MSG(num_physical_devices > 0, "No physical devices found");
     LOG_INFO(Render_Vulkan, "Found {} physical devices", num_physical_devices);
@@ -222,6 +224,9 @@ void Instance::ReportDeviceFault() const {
     for (const auto& addr : addresses) {
         LOG_CRITICAL(Render_Vulkan, "  address {:#x} (precision {:#x}) type {}",
                      addr.reportedAddress, addr.addressPrecision, vk::to_string(addr.addressType));
+        if (address_binding_report) {
+            AddressTracker::LogAddress(addr.reportedAddress);
+        }
     }
     for (const auto& vendor : vendor_infos) {
         LOG_CRITICAL(Render_Vulkan, "  vendor fault code {:#x} data {:#x}: {}",
@@ -259,7 +264,7 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
         vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
         vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
-        vk::PhysicalDeviceFaultFeaturesEXT>();
+        vk::PhysicalDeviceFaultFeaturesEXT, vk::PhysicalDeviceAddressBindingReportFeaturesEXT>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -405,6 +410,10 @@ bool Instance::CreateDevice() {
     }
     device_fault = feature_chain.get<vk::PhysicalDeviceFaultFeaturesEXT>().deviceFault &&
                    add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    address_binding_report = address_messenger &&
+                             feature_chain.get<vk::PhysicalDeviceAddressBindingReportFeaturesEXT>()
+                                 .reportAddressBinding &&
+                             add_extension(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
 
@@ -588,6 +597,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceFaultFeaturesEXT{
             .deviceFault = true,
         },
+        vk::PhysicalDeviceAddressBindingReportFeaturesEXT{
+            .reportAddressBinding = true,
+        },
     };
 
     if (!custom_border_color) {
@@ -644,6 +656,9 @@ bool Instance::CreateDevice() {
     }
     if (!device_fault) {
         device_chain.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
+    }
+    if (!address_binding_report) {
+        device_chain.unlink<vk::PhysicalDeviceAddressBindingReportFeaturesEXT>();
     }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());

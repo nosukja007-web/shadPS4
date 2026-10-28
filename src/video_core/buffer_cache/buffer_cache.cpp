@@ -421,14 +421,16 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         backing.offset = memory_offset >> block_shift;
         resident_ranges.Add(backing);
 
-        LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
-
         const auto& bind = binds->binds.emplace_back(vk::SparseMemoryBind{
             .resourceOffset = (range.start << block_shift) - arena->cpu_addr,
             .size = (range.end - range.start) << block_shift,
             .memory = device_memory,
             .memoryOffset = memory_offset,
         });
+
+        const u64 gpu_base = arena->BufferDeviceAddress() + bind.resourceOffset;
+        LOG_INFO(Render, "Making range start={}, end={} resident gpu=[{:#x}, {:#x})", backing.start,
+                 backing.end, gpu_base, gpu_base + bind.size);
         memory_offset += bind.size;
 
         if (!has_bda) {
