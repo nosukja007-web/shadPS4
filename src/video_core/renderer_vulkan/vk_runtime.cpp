@@ -104,8 +104,7 @@ static u64 ImageWithBufferCopySize(const VideoCore::Image* src, const VideoCore:
     for (u32 mip = 0; mip < num_mips; ++mip) {
         const vk::BufferImageCopy copy = {
             .imageSubresource{.layerCount = num_layers},
-            .imageExtent = {std::max(src->info.size.width >> mip, 1u),
-                            std::max(src->info.size.height >> mip, 1u),
+            .imageExtent = {src->HostWidth(mip), src->HostHeight(mip),
                             std::max(src->info.size.depth >> mip, 1u)},
         };
         const u64 offset = mip == 0 ? 0 : Common::AlignUp(size, 16);
@@ -113,6 +112,62 @@ static u64 ImageWithBufferCopySize(const VideoCore::Image* src, const VideoCore:
                                       BufferImageCopySize(copy, dst->info.pixel_format));
     }
     return size;
+}
+
+/// Filter used when resampling between native and scaled copies of an image.
+static vk::Filter ScaleFilter(const VideoCore::Image* image) {
+    if (image->info.props.is_depth) {
+        return vk::Filter::eNearest;
+    }
+    const std::string_view numeric = vk::componentNumericFormat(image->info.pixel_format, 0);
+    if (numeric == "UINT" || numeric == "SINT") {
+        return vk::Filter::eNearest;
+    }
+    return vk::Filter::eLinear;
+}
+
+/// Builds per-mip blit regions mapping src_width x src_height (at mip 0) to dst_width x
+/// dst_height across all layers.
+static SmallVector<vk::ImageBlit, 8> MakeScaleBlits(vk::ImageAspectFlags aspect, u32 num_mips,
+                                                    u32 src_layer, u32 dst_layer, u32 num_layers,
+                                                    u32 src_width, u32 src_height, u32 dst_width,
+                                                    u32 dst_height) {
+    SmallVector<vk::ImageBlit, 8> blits;
+    for (u32 mip = 0; mip < num_mips; ++mip) {
+        const s32 sw = static_cast<s32>(std::max(src_width >> mip, 1u));
+        const s32 sh = static_cast<s32>(std::max(src_height >> mip, 1u));
+        const s32 dw = static_cast<s32>(std::max(dst_width >> mip, 1u));
+        const s32 dh = static_cast<s32>(std::max(dst_height >> mip, 1u));
+        blits.push_back(vk::ImageBlit{
+            .srcSubresource{
+                .aspectMask = aspect,
+                .mipLevel = mip,
+                .baseArrayLayer = src_layer,
+                .layerCount = num_layers,
+            },
+            .srcOffsets = {{vk::Offset3D{0, 0, 0}, vk::Offset3D{sw, sh, 1}}},
+            .dstSubresource{
+                .aspectMask = aspect,
+                .mipLevel = mip,
+                .baseArrayLayer = dst_layer,
+                .layerCount = num_layers,
+            },
+            .dstOffsets = {{vk::Offset3D{0, 0, 0}, vk::Offset3D{dw, dh, 1}}},
+        });
+    }
+    return blits;
+}
+
+/// Returns true and logs once if a copy between src and dst cannot be done because their host
+/// scales differ.
+static bool ScaleMismatch(const VideoCore::Image* src, const VideoCore::Image* dst,
+                          std::string_view op) {
+    if (src->scale == dst->scale) {
+        return false;
+    }
+    LOG_WARNING(Render_Vulkan, "{}: skipping copy between scale {} {:#x} and scale {} {:#x}", op,
+                src->scale, src->info.guest_address, dst->scale, dst->info.guest_address);
+    return true;
 }
 
 Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
@@ -188,10 +243,168 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
     return image_barriers.size() != prev_num_barriers;
 }
 
+VideoCore::UniqueImage Runtime::CreateNativeStaging(const VideoCore::Image* image) {
+    auto image_ci = image->backing->image.image_ci;
+    image_ci.flags = {};
+    image_ci.extent.width = image->info.size.width;
+    image_ci.extent.height = image->info.size.height;
+    image_ci.samples = vk::SampleCountFlagBits::e1;
+    image_ci.usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+    image_ci.initialLayout = vk::ImageLayout::eUndefined;
+    VideoCore::UniqueImage staging{instance.GetDevice(), instance.GetAllocator()};
+    staging.Create(image_ci);
+    return staging;
+}
+
+void Runtime::TransitStaging(vk::Image image, vk::ImageAspectFlags aspect, vk::ImageLayout old_layout,
+                             vk::ImageLayout new_layout, vk::AccessFlags2 src_access,
+                             vk::AccessFlags2 dst_access) {
+    const vk::ImageMemoryBarrier2 barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllTransfer,
+        .srcAccessMask = src_access,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllTransfer,
+        .dstAccessMask = dst_access,
+        .oldLayout = old_layout,
+        .newLayout = new_layout,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image,
+        .subresourceRange{
+            .aspectMask = aspect,
+            .baseMipLevel = 0,
+            .levelCount = VK_REMAINING_MIP_LEVELS,
+            .baseArrayLayer = 0,
+            .layerCount = VK_REMAINING_ARRAY_LAYERS,
+        },
+    };
+    scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &barrier,
+    });
+}
+
+void Runtime::UploadScaledImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
+                                std::span<const vk::BufferImageCopy> upload_copies) {
+    // Guest data is native sized, so upload into a native staging image and upscale it.
+    auto staging = CreateNativeStaging(dst);
+    const auto aspect = dst->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
+
+    Transit(dst, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eAllTransfer,
+            vk::AccessFlagBits2::eTransferWrite);
+    for (const auto& copy : upload_copies) {
+        const auto copy_size = BufferImageCopySize(copy, dst->info.pixel_format);
+        IsBufferAccessed(src, copy.bufferOffset, copy_size);
+    }
+    FlushBarriers();
+
+    const auto cmdbuf = scheduler.CommandBuffer();
+    TransitStaging(staging.image, aspect, vk::ImageLayout::eUndefined,
+                   vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eNone,
+                   vk::AccessFlagBits2::eTransferWrite);
+    cmdbuf.copyBufferToImage(src->Handle(), staging.image, vk::ImageLayout::eTransferDstOptimal,
+                             upload_copies);
+    TransitStaging(staging.image, aspect, vk::ImageLayout::eTransferDstOptimal,
+                   vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferWrite,
+                   vk::AccessFlagBits2::eTransferRead);
+
+    const auto blits = MakeScaleBlits(aspect, dst->info.resources.levels, 0, 0,
+                                      dst->info.resources.layers, dst->info.size.width,
+                                      dst->info.size.height, dst->HostWidth(), dst->HostHeight());
+    cmdbuf.blitImage(staging.image, vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
+                     vk::ImageLayout::eTransferDstOptimal, blits, ScaleFilter(dst));
+
+    for (const auto& copy : upload_copies) {
+        const auto copy_size = BufferImageCopySize(copy, dst->info.pixel_format);
+        AccessBuffer(src, copy.bufferOffset, copy_size, vk::PipelineStageFlagBits2::eCopy,
+                     vk::AccessFlagBits2::eTransferRead);
+    }
+    scheduler.DeferOperation([staging = std::move(staging)] {});
+
+    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+}
+
+void Runtime::DownloadScaledImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
+                                  std::span<const vk::BufferImageCopy> download_copies) {
+    // Guest memory is native sized, so downscale into a native staging image first.
+    auto staging = CreateNativeStaging(src);
+    const auto aspect = src->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
+
+    Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eAllTransfer,
+            vk::AccessFlagBits2::eTransferRead);
+    for (const auto& copy : download_copies) {
+        const auto copy_size = BufferImageCopySize(copy, src->info.pixel_format);
+        IsBufferAccessed(dst, copy.bufferOffset, copy_size, true);
+    }
+    FlushBarriers();
+
+    const auto cmdbuf = scheduler.CommandBuffer();
+    TransitStaging(staging.image, aspect, vk::ImageLayout::eUndefined,
+                   vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eNone,
+                   vk::AccessFlagBits2::eTransferWrite);
+    const auto blits = MakeScaleBlits(aspect, src->info.resources.levels, 0, 0,
+                                      src->info.resources.layers, src->HostWidth(),
+                                      src->HostHeight(), src->info.size.width,
+                                      src->info.size.height);
+    cmdbuf.blitImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, staging.image,
+                     vk::ImageLayout::eTransferDstOptimal, blits, ScaleFilter(src));
+    TransitStaging(staging.image, aspect, vk::ImageLayout::eTransferDstOptimal,
+                   vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferWrite,
+                   vk::AccessFlagBits2::eTransferRead);
+    cmdbuf.copyImageToBuffer(staging.image, vk::ImageLayout::eTransferSrcOptimal, dst->Handle(),
+                             download_copies);
+
+    for (const auto& copy : download_copies) {
+        const auto copy_size = BufferImageCopySize(copy, src->info.pixel_format);
+        AccessBuffer(dst, copy.bufferOffset, copy_size, vk::PipelineStageFlagBits2::eCopy,
+                     vk::AccessFlagBits2::eTransferWrite);
+    }
+    scheduler.DeferOperation([staging = std::move(staging)] {});
+}
+
+void Runtime::BlitScaledImage(VideoCore::Image* src, VideoCore::Image* dst) {
+    const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
+    const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
+    const auto aspect = src->aspect_mask & dst->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
+    if (!aspect || src->info.props.is_block || dst->info.props.is_block ||
+        src->info.type == AmdGpu::ImageType::Color3D ||
+        dst->info.type == AmdGpu::ImageType::Color3D) {
+        ScaleMismatch(src, dst, "BlitScaledImage");
+        return;
+    }
+
+    scheduler.EndRendering();
+    bool needs_flush =
+        Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eAllTransfer,
+                vk::AccessFlagBits2::eTransferRead);
+    needs_flush |=
+        Transit(dst, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eAllTransfer,
+                vk::AccessFlagBits2::eTransferWrite);
+    if (needs_flush) {
+        FlushBarriers();
+    }
+
+    // The source covers its own native size in the destination's host space.
+    const u32 dst_width = std::min(src->info.size.width * dst->scale, dst->HostWidth());
+    const u32 dst_height = std::min(src->info.size.height * dst->scale, dst->HostHeight());
+    const auto blits = MakeScaleBlits(aspect, num_mips, 0, 0, num_layers, src->HostWidth(),
+                                      src->HostHeight(), dst_width, dst_height);
+    scheduler.CommandBuffer().blitImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal,
+                                        dst->GetImage(), vk::ImageLayout::eTransferDstOptimal,
+                                        blits, ScaleFilter(dst));
+
+    dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
+    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+}
+
 void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                           std::span<const vk::BufferImageCopy> upload_copies) {
     SetBackingSamples(dst, dst->info.num_samples, false);
     scheduler.EndRendering();
+
+    if (dst->IsScaled()) {
+        UploadScaledImage(dst, src, upload_copies);
+        return;
+    }
 
     bool needs_flush =
         Transit(dst, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eCopy,
@@ -222,6 +435,11 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
     SetBackingSamples(src, src->info.num_samples);
     scheduler.EndRendering();
 
+    if (src->IsScaled()) {
+        DownloadScaledImage(src, dst, download_copies);
+        return;
+    }
+
     bool needs_flush =
         Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
                 vk::AccessFlagBits2::eTransferRead);
@@ -245,6 +463,10 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
 }
 
 void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
+    if (src->scale != dst->scale) {
+        BlitScaledImage(src, dst);
+        return;
+    }
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
 
     // Format mismatch warning (safe but useful)
@@ -255,8 +477,8 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
                   vk::to_string(src->info.pixel_format), vk::to_string(dst->info.pixel_format));
     }
 
-    const u32 base_width = src->info.size.width;
-    const u32 base_height = src->info.size.height;
+    const u32 base_width = src->HostWidth();
+    const u32 base_height = src->HostHeight();
     const u32 base_depth =
         dst->info.type == AmdGpu::ImageType::Color3D ? dst->info.size.depth : src->info.size.depth;
 
@@ -361,7 +583,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
             .layerCount = num_layers,
         },
         .imageOffset = {0, 0, 0},
-        .imageExtent = {src->info.size.width, src->info.size.height, src->info.size.depth},
+        .imageExtent = {src->HostWidth(), src->HostHeight(), src->info.size.depth},
     };
     u64 copy_size = BufferImageCopySize(buffer_copy, src->info.pixel_format);
     SmallVector<vk::BufferImageCopy, 8> buffer_copies;
@@ -370,8 +592,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
         auto mip_copy = buffer_copy;
         mip_copy.bufferOffset = Common::AlignUp(offset + copy_size, 16);
         mip_copy.imageSubresource.mipLevel = mip;
-        mip_copy.imageExtent = vk::Extent3D{std::max(src->info.size.width >> mip, 1u),
-                                            std::max(src->info.size.height >> mip, 1u),
+        mip_copy.imageExtent = vk::Extent3D{src->HostWidth(mip), src->HostHeight(mip),
                                             std::max(src->info.size.depth >> mip, 1u)};
         copy_size =
             mip_copy.bufferOffset - offset + BufferImageCopySize(mip_copy, src->info.pixel_format);
@@ -417,6 +638,9 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
 }
 
 void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice) {
+    if (ScaleMismatch(src, dst, "CopyMip")) {
+        return;
+    }
     const auto dst_dim = dst->info.props.is_block ? 2 : 0;
     const auto mip_block_w = std::max(dst->info.size.width >> (mip + dst_dim), 1u);
     const auto mip_block_h = std::max(dst->info.size.height >> (mip + dst_dim), 1u);
@@ -443,7 +667,7 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
             .baseArrayLayer = slice,
             .layerCount = dst_layers,
         },
-        .extent = {src->info.size.width, src->info.size.height, src->info.size.depth},
+        .extent = {src->HostWidth(), src->HostHeight(), src->info.size.depth},
     };
 
     SetBackingSamples(dst, dst->info.num_samples);
@@ -472,8 +696,10 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
     if (src->info.num_samples == 1 && dst->info.num_samples == 1) {
         if ((instance.IsMaintenance8Supported() ||
              src->info.props.is_depth == dst->info.props.is_depth) &&
-            src->aspect_mask == dst->aspect_mask) {
+            src->aspect_mask == dst->aspect_mask && src->scale == dst->scale) {
             CopyImage(src, dst);
+        } else if (ScaleMismatch(src, dst, "CopyColorAndDepth")) {
+            return;
         } else {
             // Perform depth from/to color copy using the intermediate copy buffer.
             static constexpr size_t COPY_BUFFER_SIZE = 128_MB;
@@ -505,9 +731,12 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
         if (needs_flush) {
             FlushBarriers();
         }
+        if (ScaleMismatch(src, dst, "ReinterpretColorAsMsDepth")) {
+            return;
+        }
 
         blit_helper->ReinterpretColorAsMsDepth(
-            dst->info.size.width, dst->info.size.height, dst->info.num_samples,
+            dst->HostWidth(), dst->HostHeight(), dst->info.num_samples,
             src->info.pixel_format, dst->info.pixel_format, src->GetImage(), dst->GetImage());
     } else {
         LOG_WARNING(Render_Vulkan, "Unimplemented depth overlap copy");
@@ -516,6 +745,9 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
 
 void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
                                const VideoCore::SubresourceRange& sub_range) {
+    if (ScaleMismatch(src, dst, "CopyDepthStencil")) {
+        return;
+    }
     scheduler.EndRendering();
 
     bool needs_flush =
@@ -544,7 +776,7 @@ void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
             .layerCount = sub_range.extent.layers,
         },
         .dstOffset = {0, 0, 0},
-        .extent = {dst->info.size.width, dst->info.size.height, 1},
+        .extent = {dst->HostWidth(), dst->HostHeight(), 1},
     };
 
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -575,7 +807,10 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
 
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto [src_layers, dst_layers] = SanitizeCopyLayers(src->info, dst->info, 1);
-    if (!needs_resolve) {
+    if (src->scale != dst->scale) {
+        ResolveScaledImage(src, dst, src_range.base.layer, dst_range.base.layer,
+                           std::min(src_layers, dst_layers), needs_resolve);
+    } else if (!needs_resolve) {
         const vk::ImageCopy region = {
             .srcSubresource{
                 .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -591,7 +826,7 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
                 .layerCount = dst_layers,
             },
             .dstOffset = {0, 0, 0},
-            .extent = {src->info.size.width, src->info.size.height, 1},
+            .extent = {src->HostWidth(), src->HostHeight(), 1},
         };
         cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
                          vk::ImageLayout::eTransferDstOptimal, region);
@@ -611,7 +846,7 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
                 .layerCount = dst_layers,
             },
             .dstOffset = {0, 0, 0},
-            .extent = {src->info.size.width, src->info.size.height, 1},
+            .extent = {src->HostWidth(), src->HostHeight(), 1},
         };
         cmdbuf.resolveImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
                             vk::ImageLayout::eTransferDstOptimal, region);
@@ -619,6 +854,58 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
 
     dst->flags |= VideoCore::ImageFlagBits::GpuModified;
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+}
+
+void Runtime::ResolveScaledImage(VideoCore::Image* src, VideoCore::Image* dst, u32 src_layer,
+                                 u32 dst_layer, u32 num_layers, bool needs_resolve) {
+    const auto cmdbuf = scheduler.CommandBuffer();
+    constexpr auto aspect = vk::ImageAspectFlagBits::eColor;
+    const u32 dst_width = std::min(src->info.size.width * dst->scale, dst->HostWidth());
+    const u32 dst_height = std::min(src->info.size.height * dst->scale, dst->HostHeight());
+
+    if (!needs_resolve) {
+        const auto blits = MakeScaleBlits(aspect, 1, src_layer, dst_layer, num_layers,
+                                          src->HostWidth(), src->HostHeight(), dst_width,
+                                          dst_height);
+        cmdbuf.blitImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
+                         vk::ImageLayout::eTransferDstOptimal, blits, ScaleFilter(dst));
+        return;
+    }
+
+    // Multisampled sources are never scaled: resolve natively, then upscale into dst.
+    auto staging = CreateNativeStaging(dst);
+    TransitStaging(staging.image, aspect, vk::ImageLayout::eUndefined,
+                   vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eNone,
+                   vk::AccessFlagBits2::eTransferWrite);
+    const u32 width = std::min(src->HostWidth(), dst->info.size.width);
+    const u32 height = std::min(src->HostHeight(), dst->info.size.height);
+    const vk::ImageResolve region = {
+        .srcSubresource{
+            .aspectMask = aspect,
+            .mipLevel = 0,
+            .baseArrayLayer = src_layer,
+            .layerCount = num_layers,
+        },
+        .srcOffset = {0, 0, 0},
+        .dstSubresource{
+            .aspectMask = aspect,
+            .mipLevel = 0,
+            .baseArrayLayer = dst_layer,
+            .layerCount = num_layers,
+        },
+        .dstOffset = {0, 0, 0},
+        .extent = {width, height, 1},
+    };
+    cmdbuf.resolveImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, staging.image,
+                        vk::ImageLayout::eTransferDstOptimal, region);
+    TransitStaging(staging.image, aspect, vk::ImageLayout::eTransferDstOptimal,
+                   vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferWrite,
+                   vk::AccessFlagBits2::eTransferRead);
+    const auto blits = MakeScaleBlits(aspect, 1, dst_layer, dst_layer, num_layers, width, height,
+                                      width * dst->scale, height * dst->scale);
+    cmdbuf.blitImage(staging.image, vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
+                     vk::ImageLayout::eTransferDstOptimal, blits, ScaleFilter(dst));
+    scheduler.DeferOperation([staging = std::move(staging)] {});
 }
 
 void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range,
@@ -717,7 +1004,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
 
         // Copy between ms and non ms backing images
         blit_helper->CopyBetweenMsImages(
-            info.size.width, info.size.height, new_backing->num_samples, info.pixel_format,
+            image->HostWidth(), image->HostHeight(), new_backing->num_samples, info.pixel_format,
             backing->num_samples > 1, backing->image, new_backing->image);
 
         // Update current layout in tracker to new backings layout

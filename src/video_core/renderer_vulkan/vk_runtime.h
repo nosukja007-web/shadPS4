@@ -79,6 +79,21 @@ public:
 private:
     void MakeCurrent(const VideoCore::Buffer* handle);
 
+    /// Creates a single-sampled transfer image with the native (guest) extent of image.
+    VideoCore::UniqueImage CreateNativeStaging(const VideoCore::Image* image);
+    void TransitStaging(vk::Image image, vk::ImageAspectFlags aspect, vk::ImageLayout old_layout,
+                        vk::ImageLayout new_layout, vk::AccessFlags2 src_access,
+                        vk::AccessFlags2 dst_access);
+
+    void UploadScaledImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
+                           std::span<const vk::BufferImageCopy> upload_copies);
+    void DownloadScaledImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
+                             std::span<const vk::BufferImageCopy> download_copies);
+    /// Copies between images with different host scales by resampling.
+    void BlitScaledImage(VideoCore::Image* src, VideoCore::Image* dst);
+    void ResolveScaledImage(VideoCore::Image* src, VideoCore::Image* dst, u32 src_layer,
+                            u32 dst_layer, u32 num_layers, bool needs_resolve);
+
 private:
     const Instance& instance;
     Scheduler& scheduler;

@@ -171,6 +171,13 @@ public:
     /// Creates a new image with provided image info and copies subresources from image_id
     [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id);
 
+    /// Replaces image_id with a copy whose host resolution scale is new_scale.
+    [[nodiscard]] ImageId RescaleImage(ImageId image_id, u32 new_scale);
+
+    /// Rescales a render pass attachment to scale when its layout allows it, so that all
+    /// attachments of a pass share one scale. Returns the (possibly new) image id.
+    [[nodiscard]] ImageId MatchTargetScale(ImageId image_id, u32 scale);
+
     /// Reuploads image contents.
     void RefreshImage(Image& image);
 
@@ -426,6 +433,8 @@ private:
     const bool readback_linear_images;
     std::mutex download_images_mutex;
     absl::flat_hash_map<VAddr, MetaDataInfo> surface_metas;
+    /// Guest addresses written as storage images; these are never upscaled.
+    absl::flat_hash_set<VAddr> unscalable_addresses;
 };
 DECLARE_ENUM_FLAG_OPERATORS(TextureCache::DownloadMemoryFlags)
 

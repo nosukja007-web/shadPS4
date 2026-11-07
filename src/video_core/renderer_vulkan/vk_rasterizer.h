@@ -175,6 +175,7 @@ private:
 
     bool attachment_feedback_loop{};
     bool needs_barrier{};
+    u32 render_scale{1}; ///< Host resolution multiplier of the current render pass attachments.
 };
 
 } // namespace Vulkan

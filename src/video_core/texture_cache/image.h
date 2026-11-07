@@ -84,7 +84,8 @@ public:
 
 struct Image : public Common::LRUNode<> {
     explicit Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime,
-                   Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info);
+                   Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info,
+                   u32 scale = 1);
     ~Image();
 
     Image(const Image&) = delete;
@@ -99,6 +100,20 @@ struct Image : public Common::LRUNode<> {
 
     vk::Image GetImage() const {
         return backing->image.image;
+    }
+
+    bool IsScaled() const {
+        return scale > 1;
+    }
+
+    /// Width of the host image at the given mip. Guest-facing info.size stays native.
+    u32 HostWidth(u32 mip = 0) const {
+        return std::max((info.size.width * scale) >> mip, 1u);
+    }
+
+    /// Height of the host image at the given mip. Guest-facing info.size stays native.
+    u32 HostHeight(u32 mip = 0) const {
+        return std::max((info.size.height * scale) >> mip, 1u);
     }
 
     bool IsUntracked() {
@@ -142,6 +157,7 @@ public:
     Common::SlotVector<ImageView>* slot_image_views;
     std::mutex mutex;
     ImageInfo info;
+    u32 scale = 1; ///< Host resolution multiplier, only ever > 1 for 2D render targets.
     vk::ImageAspectFlags aspect_mask = vk::ImageAspectFlagBits::eColor;
     vk::SampleCountFlags supported_samples = vk::SampleCountFlagBits::e1;
     ImageFlagBits flags = ImageFlagBits::Dirty;

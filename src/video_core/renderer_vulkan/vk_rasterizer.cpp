@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <unordered_set>
+
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -30,6 +32,8 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     push_data.xscale = regs.viewport_control.xscale_enable ? regs.viewports[0].xscale : 1.f;
     push_data.yoffset = regs.viewport_control.yoffset_enable ? regs.viewports[0].yoffset : 0.f;
     push_data.yscale = regs.viewport_control.yscale_enable ? regs.viewports[0].yscale : 1.f;
+    push_data.frag_coord_scale = 1.f;
+    push_data.image_scale = EmulatorSettings.GetResolutionScale();
     return push_data;
 }
 
@@ -201,6 +205,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
     const auto state = BeginRendering(pipeline);
+    push_data.frag_coord_scale = 1.f / static_cast<float>(render_scale);
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
@@ -260,6 +265,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
     const auto state = BeginRendering(pipeline);
+    push_data.frag_coord_scale = 1.f / static_cast<float>(render_scale);
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
@@ -862,11 +868,16 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
     u32 num_images{};
+    // Shader image (descriptor) index of each binding, used for the scaled image mask.
+    std::array<u8, Shader::NUM_IMAGES> binding_desc_index{};
+    u32 desc_index = 0;
     for (const auto& image_desc : stage.images) {
+        const u32 this_desc_index = desc_index++;
         const auto tsharp = image_desc.GetSharp(stage);
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
+            binding_desc_index[num_images] = static_cast<u8>(this_desc_index);
             image_bindings[num_images++].image_id = {};
             image_descriptor_array_sizes.push_back(1);
             continue;
@@ -879,6 +890,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         "data_format={}, num_format={}",
                         tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
                         static_cast<u32>(num_fmt));
+            binding_desc_index[num_images] = static_cast<u8>(this_desc_index);
             image_bindings[num_images++].image_id = {};
             image_descriptor_array_sizes.push_back(1);
             continue;
@@ -888,6 +900,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const u32 num_bindings = image_desc.NumBindings(stage);
 
         for (auto i = 0; i < num_bindings; i++) {
+            binding_desc_index[num_images] = static_cast<u8>(this_desc_index);
             auto& [image_id, desc] = image_bindings[num_images++];
             std::construct_at(&desc, tsharp, image_desc);
 
@@ -969,6 +982,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
             image.usage.storage |= is_storage;
             image.usage.texture |= !is_storage;
+            if (image.IsScaled()) {
+                // Integer coordinate accesses and size queries in the shader get rescaled.
+                const u32 slot = stage.hw_stage == Shader::HwStage::Fragment ? 2 : 0;
+                const u32 index = binding_desc_index[i];
+                push_data.scaled_images[slot + index / 32] |= 1u << (index % 32);
+            }
 
             image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
                                      image.backing->state.layout);
@@ -1030,6 +1049,37 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     state.height = instance.GetMaxFramebufferHeight();
     state.num_layers = std::numeric_limits<u16>::max();
     state.num_color_attachments = std::bit_width(key.mrt_mask);
+    // Give every attachment of this pass the same host scale before rendering, otherwise the
+    // pass has to fall back to native size and only covers a corner of the scaled attachments.
+    u32 pass_scale = 0;
+    for (auto cb = 0u; cb < state.num_color_attachments; ++cb) {
+        auto& [image_id, desc] = cb_descs[cb];
+        if (!image_id) {
+            continue;
+        }
+        if (texture_cache.GetImage(image_id).binding.needs_rebind) {
+            image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+        }
+        pass_scale = std::max(pass_scale, texture_cache.GetImage(image_id).scale);
+    }
+    if (db_desc.image_id) {
+        pass_scale = std::max(pass_scale, texture_cache.GetImage(db_desc.image_id).scale);
+    }
+    if (pass_scale > 1) {
+        for (auto cb = 0u; cb < state.num_color_attachments; ++cb) {
+            if (auto& image_id = cb_descs[cb].image_id; image_id) {
+                image_id = texture_cache.MatchTargetScale(image_id, pass_scale);
+            }
+        }
+        if (db_desc.image_id) {
+            db_desc.image_id = texture_cache.MatchTargetScale(db_desc.image_id, pass_scale);
+        }
+    }
+
+    u32 min_scale = std::numeric_limits<u32>::max();
+    u32 max_scale = 0;
+    boost::container::static_vector<const VideoCore::Image*, AmdGpu::NUM_COLOR_BUFFERS + 1>
+        attachments;
     for (auto cb = 0u; cb < state.num_color_attachments; ++cb) {
         auto& [image_id, desc] = cb_descs[cb];
         if (!image_id) {
@@ -1072,9 +1122,12 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                                              desc.view_info.range);
         }
 
-        state.width = std::min<u32>(state.width, std::max(image->info.size.width >> mip, 1u));
-        state.height = std::min<u32>(state.height, std::max(image->info.size.height >> mip, 1u));
+        state.width = std::min<u32>(state.width, image->HostWidth(mip));
+        state.height = std::min<u32>(state.height, image->HostHeight(mip));
         state.num_layers = std::min<u32>(state.num_layers, image_view.info.range.extent.layers);
+        min_scale = std::min(min_scale, image->scale);
+        max_scale = std::max(max_scale, image->scale);
+        attachments.push_back(image);
 
         const auto clear_value =
             is_clear ? LiverpoolToVK::ColorBufferClearValue(col_buf) : vk::ClearValue{};
@@ -1123,9 +1176,12 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                                              vk::AccessFlagBits2::eDepthStencilAttachmentRead,
                                          desc.view_info.range);
 
-        state.width = std::min<u32>(state.width, image.info.size.width);
-        state.height = std::min<u32>(state.height, image.info.size.height);
+        state.width = std::min<u32>(state.width, image.HostWidth());
+        state.height = std::min<u32>(state.height, image.HostHeight());
         state.num_layers = std::min<u32>(state.num_layers, image_view.info.range.extent.layers);
+        min_scale = std::min(min_scale, image.scale);
+        max_scale = std::max(max_scale, image.scale);
+        attachments.push_back(&image);
 
         auto& attachment = state.depth_stencil_attachment;
         attachment.image_view = *image_view.image_view;
@@ -1151,6 +1207,24 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
 
     if (state.num_layers == std::numeric_limits<u16>::max()) {
         state.num_layers = 1;
+    }
+
+    // Draw in the host space of the attachments. With mixed scales the smallest one wins so
+    // every attachment stays in bounds; the larger ones only get their native-sized corner.
+    render_scale = max_scale == 0 ? 1u : min_scale;
+    if (max_scale != 0 && min_scale != max_scale) {
+        // Describe each distinct mix once so the offending targets can be identified.
+        static std::unordered_set<std::string> reported;
+        std::string desc;
+        for (const auto* image : attachments) {
+            desc += fmt::format(" [{:#x} {}x{} {} x{}]", image->info.guest_address,
+                                image->info.size.width, image->info.size.height,
+                                vk::to_string(image->info.pixel_format), image->scale);
+        }
+        if (reported.insert(desc).second) {
+            LOG_WARNING(Render_Vulkan, "Render pass mixes attachment scales, using {}:{}",
+                        min_scale, desc);
+        }
     }
 
     return state;
@@ -1404,18 +1478,21 @@ void Rasterizer::UpdateViewportScissorState() const {
             // window range [0..16383, 0..16383] and setting the viewport to its size.
             viewport.x = 0.f;
             viewport.y = 0.f;
-            viewport.width = float(std::min<u32>(instance.GetMaxViewportWidth(), 16_KB));
-            viewport.height = float(std::min<u32>(instance.GetMaxViewportHeight(), 16_KB));
+            viewport.width =
+                float(std::min<u32>(instance.GetMaxViewportWidth(), 16_KB * render_scale));
+            viewport.height =
+                float(std::min<u32>(instance.GetMaxViewportHeight(), 16_KB * render_scale));
         } else {
             const auto xoffset = vp_ctl.xoffset_enable ? vp.xoffset : 0.f;
             const auto xscale = vp_ctl.xscale_enable ? vp.xscale : 1.f;
             const auto yoffset = vp_ctl.yoffset_enable ? vp.yoffset : 0.f;
             const auto yscale = vp_ctl.yscale_enable ? vp.yscale : 1.f;
 
-            viewport.x = xoffset - xscale;
-            viewport.y = yoffset - yscale;
-            viewport.width = xscale * 2.0f;
-            viewport.height = yscale * 2.0f;
+            const float scale = static_cast<float>(render_scale);
+            viewport.x = (xoffset - xscale) * scale;
+            viewport.y = (yoffset - yscale) * scale;
+            viewport.width = xscale * 2.0f * scale;
+            viewport.height = yscale * 2.0f * scale;
         }
 
         viewports.push_back(viewport);
@@ -1431,9 +1508,10 @@ void Rasterizer::UpdateViewportScissorState() const {
             vp_scsr.bottom_right_y = std::min(AmdGpu::Scissor::Clamp(vp_scsr.bottom_right_y),
                                               regs.viewport_scissors[i].bottom_right_y);
         }
+        const s32 scale = static_cast<s32>(render_scale);
         scissors.push_back({
-            .offset = {vp_scsr.top_left_x, vp_scsr.top_left_y},
-            .extent = {vp_scsr.GetWidth(), vp_scsr.GetHeight()},
+            .offset = {vp_scsr.top_left_x * scale, vp_scsr.top_left_y * scale},
+            .extent = {vp_scsr.GetWidth() * render_scale, vp_scsr.GetHeight() * render_scale},
         });
     }
 

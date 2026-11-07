@@ -131,8 +131,10 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
 }
 
 Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
-             Common::SlotVector<ImageView>& slot_image_views_, const ImageInfo& info_)
-    : runtime{&runtime_}, slot_image_views{&slot_image_views_}, info{info_} {
+             Common::SlotVector<ImageView>& slot_image_views_, const ImageInfo& info_,
+             u32 scale_)
+    : runtime{&runtime_}, slot_image_views{&slot_image_views_}, info{info_},
+      scale{std::max(scale_, 1u)} {
     if (info.pixel_format == vk::Format::eUndefined) {
         return;
     }
@@ -184,8 +186,8 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
         .imageType = ConvertImageType(info.type),
         .format = supported_format,
         .extent{
-            .width = info.size.width,
-            .height = info.size.height,
+            .width = HostWidth(),
+            .height = HostHeight(),
             .depth = info.size.depth,
         },
         .mipLevels = static_cast<u32>(info.resources.levels),
@@ -202,10 +204,10 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     backing->image.Create(image_ci);
 
     Vulkan::SetObjectName(instance.GetDevice(), GetImage(),
-                          "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{}", info.size.width,
+                          "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{} X:{}", info.size.width,
                           info.size.height, info.size.depth, AmdGpu::NameOf(info.tile_mode),
                           vk::to_string(info.pixel_format), info.guest_address, info.guest_size,
-                          info.resources.layers, info.resources.levels, info.num_samples);
+                          info.resources.layers, info.resources.levels, info.num_samples, scale);
 }
 
 Image::~Image() = default;

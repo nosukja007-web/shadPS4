@@ -49,6 +49,50 @@ static u64 HashBackingMemory(VAddr virtual_addr, u64 size) {
     return hash;
 }
 
+/// Returns true if an image with this layout can have an upscaled host image at all.
+static bool CanScaleImage(const ImageInfo& info) {
+    return info.pixel_format != vk::Format::eUndefined &&
+           (info.type == AmdGpu::ImageType::Color2D ||
+            info.type == AmdGpu::ImageType::Color2DArray) &&
+           !info.props.is_block && info.num_samples == 1;
+}
+
+/// Picks the host resolution multiplier for a newly created render or depth target.
+/// Square targets (shadow maps, LUTs), small targets, MSAA and mipmapped targets stay native,
+/// as do targets the guest has written as storage images.
+static u32 DecideResolutionScale(const Vulkan::Instance& instance, const ImageInfo& info,
+                                 const absl::flat_hash_set<VAddr>& unscalable_addresses) {
+    const u32 scale = EmulatorSettings.GetResolutionScale();
+    if (scale <= 1 || unscalable_addresses.contains(info.guest_address)) {
+        return 1;
+    }
+    if (!CanScaleImage(info)) {
+        return 1;
+    }
+    const u32 width = info.size.width;
+    const u32 height = info.size.height;
+    if (width < 256 || height < 256 || width == height) {
+        return 1;
+    }
+    // Diagnostic filter: SHADPS4_RES_SCALE_ONLY=WxH[,WxH...] scales only targets of those sizes.
+    static const std::string only_sizes = [] {
+        const char* env = std::getenv("SHADPS4_RES_SCALE_ONLY");
+        return env ? std::string{env} : std::string{};
+    }();
+    if (!only_sizes.empty() &&
+        only_sizes.find(fmt::format("{}x{}", width, height)) == std::string::npos) {
+        return 1;
+    }
+    if (width * scale > instance.GetMaxFramebufferWidth() ||
+        height * scale > instance.GetMaxFramebufferHeight()) {
+        return 1;
+    }
+    LOG_INFO(Render_Vulkan, "Scaling {} target {:#x} {}x{} layers {} {} by {}x",
+             info.props.is_depth ? "depth" : "color", info.guest_address, width, height,
+             info.resources.layers, vk::to_string(info.pixel_format), scale);
+    return scale;
+}
+
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
                            BufferCache& buffer_cache_, PageManager& page_manager_)
@@ -297,7 +341,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         auto new_info = requested_info;
         new_info.resources = std::max(requested_info.resources, cache_image.info.resources);
         new_info.UpdateSize();
-        const auto new_image_id = slot_images.Insert(instance, runtime, slot_image_views, new_info);
+        const auto new_image_id = slot_images.Insert(instance, runtime, slot_image_views, new_info,
+                                                     cache_image.scale);
         RegisterImage(new_image_id);
 
         // Inherit image usage
@@ -545,8 +590,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                 // Otherwise it's later created from guest memory and the GPU data is lost
                 // And reads/writes go to different images.
                 if (!merged_image_id) {
-                    merged_image_id =
-                        slot_images.Insert(instance, runtime, slot_image_views, image_info);
+                    merged_image_id = slot_images.Insert(instance, runtime, slot_image_views,
+                                                         image_info, cache_image.scale);
                     RegisterImage(merged_image_id);
                     RefreshImage(slot_images[merged_image_id]);
                     TrackImage(merged_image_id);
@@ -562,7 +607,11 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
-    const auto new_image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
+    // Keep the source scale only where a scaled image is still allowed.
+    const u32 src_scale = slot_images[image_id].scale;
+    const u32 new_scale = CanScaleImage(info) ? src_scale : 1u;
+    const auto new_image_id =
+        slot_images.Insert(instance, runtime, slot_image_views, info, new_scale);
     RegisterImage(new_image_id);
 
     auto& src_image = slot_images[image_id];
@@ -586,6 +635,46 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     }
     FreeImage(image_id);
 
+    return new_image_id;
+}
+
+ImageId TextureCache::MatchTargetScale(ImageId image_id, u32 scale) {
+    const Image& image = slot_images[image_id];
+    if (image.scale == scale || !CanScaleImage(image.info) ||
+        image.info.size.width * scale > instance.GetMaxFramebufferWidth() ||
+        image.info.size.height * scale > instance.GetMaxFramebufferHeight()) {
+        return image_id;
+    }
+    LOG_INFO(Render_Vulkan, "Rescaling target {:#x} {}x{} {} from {}x to {}x to match its pass",
+             image.info.guest_address, image.info.size.width, image.info.size.height,
+             vk::to_string(image.info.pixel_format), image.scale, scale);
+    return RescaleImage(image_id, scale);
+}
+
+ImageId TextureCache::RescaleImage(ImageId image_id, u32 new_scale) {
+    const ImageInfo info = slot_images[image_id].info;
+    const auto new_image_id =
+        slot_images.Insert(instance, runtime, slot_image_views, info, new_scale);
+    RegisterImage(new_image_id);
+
+    auto& src_image = slot_images[image_id];
+    auto& new_image = slot_images[new_image_id];
+    const bool src_has_gpu_data = src_image.HasGpuValidData();
+
+    RefreshImage(new_image);
+    if (src_image.binding.is_bound || src_image.binding.is_target) {
+        src_image.binding.needs_rebind = 1u;
+    }
+    new_image.usage = src_image.usage;
+    new_image.depth_id = src_image.depth_id;
+    new_image.depth_uid = src_image.depth_uid;
+
+    TrackImage(new_image_id);
+    new_image.flags &= ~ImageFlagBits::Dirty;
+    if (src_has_gpu_data) {
+        runtime.CopyImage(&src_image, &new_image);
+    }
+    FreeImage(image_id);
     return new_image_id;
 }
 
@@ -655,8 +744,25 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     // Create and register a new image
     if (!image_id) {
-        image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
+        const bool is_target =
+            desc.type == BindingType::RenderTarget || desc.type == BindingType::DepthTarget;
+        const u32 scale =
+            is_target ? DecideResolutionScale(instance, info, unscalable_addresses) : 1u;
+        image_id = slot_images.Insert(instance, runtime, slot_image_views, info, scale);
         RegisterImage(image_id);
+    } else if (view_mip <= 0 && view_slice <= 0) {
+        // Storage writes to upscaled images are replicated over the host texel block by the
+        // shader, so only native targets need attention here.
+        const Image& existing = slot_images[image_id];
+        if ((desc.type == BindingType::RenderTarget || desc.type == BindingType::DepthTarget) &&
+            !existing.IsScaled()) {
+            // A target first seen as a texture would otherwise mix scales in a render pass.
+            if (const u32 scale =
+                    DecideResolutionScale(instance, existing.info, unscalable_addresses);
+                scale > 1) {
+                image_id = RescaleImage(image_id, scale);
+            }
+        }
     }
 
     Image& image = slot_images[image_id];
@@ -707,6 +813,12 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
+        if (image.IsScaled() && !image.usage.storage) {
+            LOG_INFO(Render_Vulkan, "Scaled image {:#x} {}x{} {} bound as storage",
+                     image.info.guest_address, image.info.size.width, image.info.size.height,
+                     vk::to_string(image.info.pixel_format));
+            image.usage.storage = 1u;
+        }
         image.flags |= ImageFlagBits::GpuModified;
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
             image.info.guest_address != 0) {
