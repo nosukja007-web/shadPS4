@@ -169,6 +169,10 @@ void CFG::SplitDivergenceScopes() {
                // with SAVEEXEC to mask the threads that didn't pass the condition
                // of initial branch.
                (inst.opcode == Opcode::S_ANDN2_B64 && inst.dst[0].field == OperandField::ExecLo) ||
+               // The compiler may also re-mask EXEC from a saved copy without saving it again,
+               // e.g. "s_and_b64 exec, s[2:3], s[0:1]" to re-enter a branch on the same
+               // condition after an else block.
+               (inst.opcode == Opcode::S_AND_B64 && inst.dst[0].field == OperandField::ExecLo) ||
                inst.IsCmpx();
     };
     const auto is_close_scope = [](const GcnInst& inst) {
@@ -180,7 +184,10 @@ void CFG::SplitDivergenceScopes() {
                // Those instructions need to be wrapped in the condition as well so allow branch
                // as end scope instruction.
                inst.opcode == Opcode::S_CBRANCH_EXECZ || inst.opcode == Opcode::S_ENDPGM ||
-               (inst.opcode == Opcode::S_ANDN2_B64 && inst.dst[0].field == OperandField::ExecLo);
+               (inst.opcode == Opcode::S_ANDN2_B64 && inst.dst[0].field == OperandField::ExecLo) ||
+               // Any other write to EXEC changes the active lanes, so instructions after it must
+               // not stay in the previous scope.
+               (inst.opcode == Opcode::S_AND_B64 && inst.dst[0].field == OperandField::ExecLo);
     };
 
     for (auto blk = blocks.begin(); blk != blocks.end(); blk++) {
