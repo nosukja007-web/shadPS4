@@ -186,6 +186,8 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
+static bool ShouldSkipGraphicsPipeline(const GraphicsPipeline* pipeline);
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
@@ -197,7 +199,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     const auto& regs = liverpool->regs;
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
-    if (!pipeline) {
+    if (!pipeline || ShouldSkipGraphicsPipeline(pipeline)) {
         return;
     }
 
@@ -256,7 +258,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         .is_indirect = true,
     };
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
-    if (!pipeline) {
+    if (!pipeline || ShouldSkipGraphicsPipeline(pipeline)) {
         return;
     }
 
@@ -319,6 +321,43 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
 
     ResetBindings(false);
+}
+
+static std::vector<u64> ParseHashList(const char* env_name) {
+    std::vector<u64> list;
+    const char* env = std::getenv(env_name);
+    if (!env) {
+        return list;
+    }
+    std::string_view view{env};
+    while (!view.empty()) {
+        const size_t comma = view.find(',');
+        const std::string item{view.substr(0, comma)};
+        if (!item.empty()) {
+            list.push_back(std::strtoull(item.c_str(), nullptr, 16));
+            LOG_WARNING(Render_Vulkan, "{}: skipping shader {:#x}", env_name, list.back());
+        }
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        view.remove_prefix(comma + 1);
+    }
+    return list;
+}
+
+// Debugging aid: graphics pipelines using any shader hash listed in SHADPS4_SKIP_GFX are not
+// drawn.
+static bool ShouldSkipGraphicsPipeline(const GraphicsPipeline* pipeline) {
+    static const std::vector<u64> skip_list = ParseHashList("SHADPS4_SKIP_GFX");
+    if (skip_list.empty()) {
+        return false;
+    }
+    for (const auto* stage : pipeline->GetStages()) {
+        if (stage && std::ranges::contains(skip_list, stage->pgm_hash)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Debugging aid: comma separated compute shader hashes in SHADPS4_SKIP_CS are not dispatched.
