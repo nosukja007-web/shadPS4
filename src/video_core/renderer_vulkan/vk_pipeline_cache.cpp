@@ -378,12 +378,6 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (is_new) {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
-        if (infos[0]) {
-            const auto& cs_pgm = liverpool->GetCsRegs();
-            LOG_INFO(Render_Vulkan, "  cs {:#x} workgroup {}x{}x{} lds {:#x}", infos[0]->pgm_hash,
-                     cs_pgm.num_thread_x.full, cs_pgm.num_thread_y.full, cs_pgm.num_thread_z.full,
-                     cs_pgm.SharedMemSize());
-        }
 
         ComputePipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,

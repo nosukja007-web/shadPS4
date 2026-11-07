@@ -115,7 +115,6 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
 
     std::vector<IR::Inst*> worklist;
     const auto uniform_blocks = FindUniformBlocks(program);
-    bool has_divergent_ballot = false;
     for (IR::Block* block : program.blocks) {
         const bool is_uniform = std::ranges::contains(uniform_blocks, block);
         const auto push_worklist = [&](IR::Inst& inst) {
@@ -124,9 +123,6 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
             } else {
                 LOG_WARNING(Render_Recompiler, "{} instruction in non uniform control flow",
                             inst.GetOpcode());
-                if (inst.GetOpcode() == IR::Opcode::Ballot) {
-                    has_divergent_ballot = true;
-                }
             }
         };
         for (IR::Inst& inst : block->Instructions()) {
@@ -147,26 +143,6 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
                 }
             }
         }
-    }
-    if (has_divergent_ballot) {
-        // A ballot that cannot be widened leaves a 32-bit subgroup-local mask. Widening the
-        // other ballots to a full wave64 mask would mix the two layouts: lanes 32-63 test the
-        // low word of a widened mask with the native InverseBallot, and scalar tests such as
-        // s_cbranch_scc on (widened & ~local) never reach zero. Keep every ballot and every
-        // masked bit count that consumes one subgroup-local instead, so the shader runs
-        // consistently as two independent 32-wide halves.
-        LOG_WARNING(Render_Recompiler,
-                    "Shader has ballots in non uniform control flow, keeping all ballots "
-                    "subgroup-local");
-        std::erase_if(worklist, [](IR::Inst* inst) {
-            if (inst->GetOpcode() == IR::Opcode::Ballot) {
-                return true;
-            }
-            if (inst->GetOpcode() == IR::Opcode::MaskedBitCount32) {
-                return FindBallotForMaskedBitCount(*inst) != nullptr;
-            }
-            return false;
-        });
     }
     if (worklist.empty()) {
         return;
