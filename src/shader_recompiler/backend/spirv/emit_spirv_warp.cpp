@@ -39,6 +39,8 @@ Id EmitReadLane(EmitContext& ctx, Id value, Id lane) {
 }
 
 Id EmitWriteLane(EmitContext& ctx, Id value, Id write_value, u32 lane) {
+    LOG_WARNING(Render_Recompiler, "Unresolved WriteLane to lane {} reached SPIR-V emission",
+                lane);
     return ctx.u32_zero_value;
 }
 

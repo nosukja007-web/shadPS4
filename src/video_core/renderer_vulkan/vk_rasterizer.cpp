@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstdlib>
+#include <string>
+#include <string_view>
+#include <vector>
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -316,6 +321,32 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     ResetBindings(false);
 }
 
+// Debugging aid: comma separated compute shader hashes in SHADPS4_SKIP_CS are not dispatched.
+static bool ShouldSkipComputeShader(u64 hash) {
+    static const std::vector<u64> skip_list = [] {
+        std::vector<u64> list;
+        const char* env = std::getenv("SHADPS4_SKIP_CS");
+        if (!env) {
+            return list;
+        }
+        std::string_view view{env};
+        while (!view.empty()) {
+            const size_t comma = view.find(',');
+            const std::string item{view.substr(0, comma)};
+            if (!item.empty()) {
+                list.push_back(std::strtoull(item.c_str(), nullptr, 16));
+                LOG_WARNING(Render_Vulkan, "Skipping compute shader {:#x}", list.back());
+            }
+            if (comma == std::string_view::npos) {
+                break;
+            }
+            view.remove_prefix(comma + 1);
+        }
+        return list;
+    }();
+    return std::ranges::contains(skip_list, hash);
+}
+
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
 
@@ -328,6 +359,9 @@ void Rasterizer::DispatchDirect() {
     }
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
+    if (ShouldSkipComputeShader(cs.pgm_hash)) {
+        return;
+    }
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
         return;
     }
@@ -359,6 +393,9 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     const auto& cs_program = liverpool->GetCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
     if (!pipeline) {
+        return;
+    }
+    if (ShouldSkipComputeShader(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash)) {
         return;
     }
 
