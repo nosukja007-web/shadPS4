@@ -165,6 +165,14 @@ public:
     VAddr track_addr_end = 0;
     ImageId depth_id{};
     u64 depth_uid{};
+    /// Bumped whenever the image is transitioned for a write access (attachment, transfer,
+    /// shader or memory write). Used to detect that derived copies may be stale.
+    u64 write_tick{};
+    /// Unregistered R8 color image holding a copy of this depth image's stencil aspect, used
+    /// when a shader reads the stencil plane through a float-class (e.g. R8 Unorm) T#.
+    ImageId stencil_color_id{};
+    /// Value of write_tick when stencil_color_id was last filled (~0 = never).
+    u64 stencil_color_tick = ~0ULL;
 
     vk::ImageUsageFlags usage_flags;
     vk::FormatFeatureFlags2 format_features;

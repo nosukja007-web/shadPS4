@@ -150,6 +150,12 @@ public:
     /// Links the stencil plane of a depth surface to its depth image.
     void AssociateStencil(ImageId depth_id, const ImageInfo& depth_info);
 
+    /// Returns an R8 color image holding a copy of the stencil aspect of depth image depth_id,
+    /// refreshing the copy if the depth image may have been written since the last copy.
+    /// Used when a shader reads the stencil plane through a float-class T#, as Vulkan only
+    /// allows the stencil aspect to be read with an unsigned integer sampled type.
+    [[nodiscard]] ImageId GetStencilColorCopy(ImageId depth_id);
+
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
         Image& image = slot_images[image_id];

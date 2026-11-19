@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
+#include <set>
 #include <unordered_set>
 
 #include "common/debug.h"
@@ -920,6 +922,32 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 // Redirect the access to the actual depth-stencil buffer.
                 image_id = depth_image_id;
                 image = &texture_cache.GetImage(image_id);
+
+                const bool float_class =
+                    AmdGpu::GetNumberClass(num_fmt) == AmdGpu::NumberClass::Float;
+                {
+                    static std::mutex logged_mutex;
+                    static std::set<std::pair<u32, u32>> logged;
+                    std::scoped_lock lk{logged_mutex};
+                    if (logged.emplace(static_cast<u32>(data_fmt), static_cast<u32>(num_fmt))
+                            .second) {
+                        LOG_INFO(Render_Vulkan,
+                                 "Stencil read through T# address={:#x} data_format={} "
+                                 "num_format={} view_format={} storage={} depth_samples={}",
+                                 tsharp.Address(), magic_enum::enum_name(data_fmt),
+                                 magic_enum::enum_name(num_fmt), vk::to_string(desc.view_info.format),
+                                 image_desc.is_written, image->info.num_samples);
+                    }
+                }
+                // Vulkan only allows reading the stencil aspect with an unsigned integer sampled
+                // type, but a float-class T# makes the shader declare a float image, which gives
+                // undefined results. Bind an R8 color copy of the stencil plane instead.
+                if (float_class && !image_desc.is_written && image->info.num_samples == 1 &&
+                    (image->aspect_mask & vk::ImageAspectFlagBits::eStencil) &&
+                    Vulkan::LiverpoolToVK::IsFormatStencilCompatible(desc.view_info.format)) {
+                    image_id = texture_cache.GetStencilColorCopy(image_id);
+                    image = &texture_cache.GetImage(image_id);
+                }
             }
             if (image->binding.is_bound) {
                 // The image is already bound. In case if it is about to be used as storage we

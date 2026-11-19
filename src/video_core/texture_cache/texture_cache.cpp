@@ -952,6 +952,45 @@ void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_inf
     stencil_image.AssociateDepth(depth_id, slot_images[depth_id].image_uid);
 }
 
+ImageId TextureCache::GetStencilColorCopy(ImageId depth_id) {
+    ASSERT(slot_images[depth_id].aspect_mask & vk::ImageAspectFlagBits::eStencil);
+    if (!slot_images[depth_id].stencil_color_id) {
+        const ImageInfo& depth_info = slot_images[depth_id].info;
+        const u32 depth_scale = slot_images[depth_id].scale;
+        ImageInfo info = depth_info;
+        info.props = {};
+        info.pixel_format = vk::Format::eR8Unorm;
+        info.num_bits = 8;
+        info.num_samples = 1;
+        info.meta_info = {};
+        if (info.stencil_addr != 0) {
+            info.guest_address = info.stencil_addr;
+            info.guest_size = info.stencil_size;
+        }
+        // The copy is never registered or tracked: it lives and dies with the depth image.
+        // Insert may reallocate slot storage, so the depth image is looked up again after it.
+        const ImageId color_id =
+            slot_images.Insert(instance, runtime, slot_image_views, info, depth_scale);
+        Image& depth_image = slot_images[depth_id];
+        depth_image.stencil_color_id = color_id;
+        depth_image.stencil_color_tick = ~0ULL;
+        LOG_INFO(Render_Vulkan,
+                 "Created R8 stencil copy for depth image {:#x} {}x{} layers {} scale {}",
+                 depth_image.info.guest_address, depth_image.info.size.width,
+                 depth_image.info.size.height, depth_image.info.resources.layers,
+                 depth_image.scale);
+    }
+    Image& depth_image = slot_images[depth_id];
+    const ImageId color_id = depth_image.stencil_color_id;
+    if (depth_image.stencil_color_tick != depth_image.write_tick) {
+        Image& color_image = slot_images[color_id];
+        runtime.CopyStencilToColor(&depth_image, &color_image);
+        // The copy only reads the depth image, so write_tick is unchanged here.
+        depth_image.stencil_color_tick = depth_image.write_tick;
+    }
+    return color_id;
+}
+
 void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
@@ -1337,6 +1376,10 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::TouchImage(Image& image) {
+    // Unregistered images are not linked in the LRU list; touching them would corrupt it.
+    if (False(image.flags & ImageFlagBits::Registered)) {
+        return;
+    }
     image_lru_cache.Touch(image, gc_tick);
 }
 
@@ -1362,6 +1405,11 @@ void TextureCache::DeleteImage(ImageId image_id) {
         if (download_images.contains(image_id)) {
             download_images.erase(image_id);
         }
+    }
+
+    // Delete the unregistered stencil color copy owned by this image.
+    if (const ImageId stencil_color_id = std::exchange(image.stencil_color_id, ImageId{})) {
+        DeleteImage(stencil_color_id);
     }
 
     // Reclaim image and any image views it references.

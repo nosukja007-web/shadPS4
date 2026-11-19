@@ -787,6 +787,85 @@ void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
+void Runtime::CopyStencilToColor(VideoCore::Image* src, VideoCore::Image* dst) {
+    ASSERT(src->aspect_mask & vk::ImageAspectFlagBits::eStencil);
+    ASSERT(src->scale == dst->scale);
+    SetBackingSamples(src, src->info.num_samples);
+
+    const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
+    const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
+
+    // Stencil aspect data in buffers is tightly packed, one byte per texel. Offsets of
+    // depth/stencil buffer copies must be multiples of 4.
+    SmallVector<vk::BufferImageCopy, 8> buffer_copies;
+    u64 copy_size = 0;
+    for (u32 mip = 0; mip < num_mips; ++mip) {
+        const u32 width = src->HostWidth(mip);
+        const u32 height = src->HostHeight(mip);
+        buffer_copies.push_back(vk::BufferImageCopy{
+            .bufferOffset = copy_size,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eStencil,
+                .mipLevel = mip,
+                .baseArrayLayer = 0,
+                .layerCount = num_layers,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {width, height, 1},
+        });
+        copy_size = Common::AlignUp(copy_size + u64(width) * height * num_layers, 16);
+    }
+
+    const auto copy_ref = staging_pool.Request(copy_size, VideoCore::MemoryType::DeviceLocal, 16);
+    for (auto& copy : buffer_copies) {
+        copy.bufferOffset += copy_ref.offset;
+    }
+
+    scheduler.EndRendering();
+
+    // Apply any pending transitions first so this image's transitions below are not batched
+    // together with an earlier transition of the same image.
+    FlushBarriers();
+    bool needs_flush =
+        Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
+                vk::AccessFlagBits2::eTransferRead);
+    needs_flush |= Transit(dst, vk::ImageLayout::eTransferDstOptimal,
+                           vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
+    needs_flush |= IsBufferAccessed(copy_ref.buffer, copy_ref.offset, copy_size, true);
+    if (needs_flush) {
+        FlushBarriers();
+    }
+
+    auto cmdbuf = scheduler.CommandBuffer();
+    cmdbuf.copyImageToBuffer(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal,
+                             copy_ref.buffer->Handle(), buffer_copies);
+
+    const vk::MemoryBarrier2 post_copy_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1u,
+        .pMemoryBarriers = &post_copy_barrier,
+    });
+
+    for (auto& copy : buffer_copies) {
+        copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+    }
+    cmdbuf.copyBufferToImage(copy_ref.buffer->Handle(), dst->GetImage(),
+                             vk::ImageLayout::eTransferDstOptimal, buffer_copies);
+
+    AccessBuffer(copy_ref.buffer, copy_ref.offset, copy_size, vk::PipelineStageFlagBits2::eCopy,
+                 vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite);
+
+    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
+    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+}
+
 void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
                            const VideoCore::SubresourceRange& src_range,
                            const VideoCore::SubresourceRange& dst_range) {

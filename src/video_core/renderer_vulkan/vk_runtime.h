@@ -60,6 +60,10 @@ public:
     void CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
                           const VideoCore::SubresourceRange& sub_range);
 
+    /// Copies the stencil aspect of a single-sampled depth-stencil image into an R8 color image
+    /// of the same host extent, layers and mips through an intermediate buffer.
+    void CopyStencilToColor(VideoCore::Image* src, VideoCore::Image* dst);
+
     void ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
                       const VideoCore::SubresourceRange& src_range,
                       const VideoCore::SubresourceRange& dst_range);

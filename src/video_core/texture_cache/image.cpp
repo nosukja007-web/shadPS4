@@ -231,6 +231,15 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
 void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                         vk::PipelineStageFlags2 dst_stage,
                         std::optional<SubresourceRange> subres_range) {
+    constexpr auto any_write_flags =
+        vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite |
+        vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eMemoryWrite |
+        vk::AccessFlagBits2::eColorAttachmentWrite |
+        vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+    if (dst_mask & any_write_flags) {
+        ++write_tick;
+    }
+
     auto& last_state = backing->state;
     auto& subresource_states = backing->subresource_states;
 
