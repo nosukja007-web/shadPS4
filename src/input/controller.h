@@ -55,6 +55,9 @@ private:
     AxisArray<u64> axis_smoothing_start_times{0};
     AxisArray<int> axis_smoothing_start_values{axis_defaults};
     AxisArray<int> axis_smoothing_end_values{axis_defaults};
+    // Anti-snapback: last time each stick axis was pushed far in one direction.
+    AxisArray<int> snapback_last_sign{0};
+    AxisArray<u64> snapback_last_time{0};
 
 public:
     void OnButton(Libraries::Pad::OrbisPadButtonDataOffset, bool);
@@ -63,6 +66,7 @@ public:
     void OnGyro(const float[3]);
     void OnAccel(const float[3]);
     void UpdateAxisSmoothing(u64 timestamp);
+    void ApplyAntiSnapback(u64 timestamp);
 
     Libraries::Pad::OrbisPadButtonDataOffset buttonsState{};
     u64 time = 0;
@@ -118,6 +122,8 @@ private:
     u8 m_next_touch_id{1};
     u64 m_touch_down_timestamp{};
     u64 m_last_orientation_update{};
+    u64 m_last_queue_push{};
+    Libraries::Pad::OrbisPadButtonDataOffset m_last_queue_buttons{};
     Colour colour;
     std::optional<Colour> override_colour{};
 

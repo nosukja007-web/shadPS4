@@ -83,6 +83,28 @@ int GameController::ReadStates(State* states, int states_num) {
         return 1;
     }
 
+    // The queue fills at the input event rate, which can be far above the 250 Hz of a real pad.
+    // If the game reads fewer reports than were queued, hand it the newest ones instead of
+    // letting a backlog build up, which would replay old stick motion late.
+    u64 dropped = 0;
+    while (m_states_queue.Size() > static_cast<u64>(states_num)) {
+        m_states_queue.Pop();
+        ++dropped;
+    }
+    {
+        static u64 stat_calls = 0, stat_requested = 0, stat_dropped = 0, stat_last = 0;
+        stat_calls++;
+        stat_requested += states_num;
+        stat_dropped += dropped;
+        const u64 now = Libraries::Kernel::sceKernelGetProcessTime();
+        if (now - stat_last > 5'000'000) {
+            LOG_INFO(Input, "Pad read stats: {} multi-reads, avg num {}, dropped {} stale reports",
+                     stat_calls, stat_requested / stat_calls, stat_dropped);
+            stat_calls = stat_requested = stat_dropped = 0;
+            stat_last = now;
+        }
+    }
+
     int read_count = 0;
     while (read_count < states_num) {
         auto state = m_states_queue.Pop();
@@ -212,7 +234,14 @@ void GameController::PushStateLocked(u64 timestamp) {
     m_state.time = timestamp;
     m_state.touch_time_since_held_down =
         m_touch_down_timestamp == 0 ? 0 : timestamp - m_touch_down_timestamp;
-    m_states_queue.Push(m_state);
+    // Queue reports at most every 4 ms (a real pad's 250 Hz) unless a button or the connection
+    // changed; the 4 ms poll timer queues the latest stick values in between.
+    const bool force = m_state.buttonsState != m_last_queue_buttons || !m_state.connected;
+    if (force || timestamp - m_last_queue_push >= 4000 || timestamp < m_last_queue_push) {
+        m_states_queue.Push(m_state);
+        m_last_queue_push = timestamp;
+        m_last_queue_buttons = m_state.buttonsState;
+    }
 }
 
 void GameController::SetLightBarRGB(u8 const r, u8 const g, u8 const b) {
