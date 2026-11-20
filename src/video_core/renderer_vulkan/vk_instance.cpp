@@ -264,7 +264,8 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
         vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
         vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
-        vk::PhysicalDeviceFaultFeaturesEXT, vk::PhysicalDeviceAddressBindingReportFeaturesEXT>();
+        vk::PhysicalDeviceFaultFeaturesEXT, vk::PhysicalDeviceAddressBindingReportFeaturesEXT,
+        vk::PhysicalDeviceTransformFeedbackFeaturesEXT>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -282,7 +283,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 40> enabled_extensions;
+    boost::container::static_vector<const char*, 48> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -361,6 +362,9 @@ bool Instance::CreateDevice() {
             add_extension(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
     }
     provoking_vertex = add_extension(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
+    if (feature_chain.get<vk::PhysicalDeviceTransformFeedbackFeaturesEXT>().transformFeedback) {
+        transform_feedback = add_extension(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
+    }
     shader_stencil_export = add_extension(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
     image_load_store_lod = add_extension(VK_AMD_SHADER_IMAGE_LOAD_STORE_LOD_EXTENSION_NAME);
     amd_gcn_shader = add_extension(VK_AMD_GCN_SHADER_EXTENSION_NAME);
@@ -551,6 +555,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceProvokingVertexFeaturesEXT{
             .provokingVertexLast = true,
         },
+        vk::PhysicalDeviceTransformFeedbackFeaturesEXT{
+            .transformFeedback = true,
+        },
         vk::PhysicalDeviceVertexAttributeDivisorFeatures{
             .vertexAttributeInstanceRateDivisor = true,
         },
@@ -625,6 +632,9 @@ bool Instance::CreateDevice() {
     }
     if (!provoking_vertex) {
         device_chain.unlink<vk::PhysicalDeviceProvokingVertexFeaturesEXT>();
+    }
+    if (!transform_feedback) {
+        device_chain.unlink<vk::PhysicalDeviceTransformFeedbackFeaturesEXT>();
     }
     if (!maintenance_5) {
         device_chain.unlink<vk::PhysicalDeviceMaintenance5FeaturesKHR>();

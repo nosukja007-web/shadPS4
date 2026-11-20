@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <map>
+#include <vector>
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/opcodes.h"
 #include "shader_recompiler/ir/operand_helper.h"
@@ -100,6 +103,62 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
             dwords_per_vertex = info.gs_copy_data.num_comps;
         }
 
+        // Stream-out: each captured dword gets its own output (Param num_attrs + k) that the
+        // SPIR-V backend decorates for transform feedback.
+        auto& copy_data = info.gs_copy_data;
+        const bool use_xfb = gs_info.xfb_buffer_mask != 0 && !copy_data.xfb_parse_failed &&
+                             !copy_data.xfb_outputs.empty() &&
+                             copy_data.num_attrs + copy_data.xfb_outputs.size() <= IR::NumParams;
+        if (gs_info.xfb_buffer_mask != 0 && !use_xfb) {
+            LOG_ERROR(Render_Recompiler,
+                      "GS stream-out requested but copy shader {:#x} could not be mapped "
+                      "(failed={}, outputs={}, attrs={})",
+                      gs_info.vs_copy_hash, copy_data.xfb_parse_failed,
+                      copy_data.xfb_outputs.size(), copy_data.num_attrs);
+        }
+        copy_data.xfb_active = use_xfb;
+        std::map<u32, std::vector<u32>> xfb_users; // ring offset -> captured dwords using it
+        std::vector<u32> xfb_pending(copy_data.xfb_outputs.size(), 0);
+        std::map<u32, IR::F32> xfb_latest;
+        if (use_xfb) {
+            for (u32 k = 0; k < copy_data.xfb_outputs.size(); k++) {
+                const auto& out = copy_data.xfb_outputs[k];
+                xfb_users[out.src[0]].push_back(k);
+                if (out.pack_half && out.src[1] != out.src[0]) {
+                    xfb_users[out.src[1]].push_back(k);
+                }
+            }
+        }
+        const auto capture_xfb = [&](IR::IREmitter& ir, u32 ring_ofs, const IR::F32& data) {
+            const auto it = xfb_users.find(ring_ofs);
+            if (it == xfb_users.end()) {
+                return;
+            }
+            xfb_latest.insert_or_assign(ring_ofs, data);
+            for (const u32 k : it->second) {
+                const auto& out = copy_data.xfb_outputs[k];
+                if (out.src[0] == ring_ofs) {
+                    xfb_pending[k] |= 1u;
+                }
+                if (out.pack_half && out.src[1] == ring_ofs) {
+                    xfb_pending[k] |= 2u;
+                }
+                const u32 needed = out.pack_half ? 3u : 1u;
+                if ((xfb_pending[k] & needed) != needed) {
+                    continue;
+                }
+                xfb_pending[k] = 0;
+                IR::F32 value = xfb_latest.at(out.src[0]);
+                if (out.pack_half) {
+                    const IR::Value vec =
+                        ir.CompositeConstruct(xfb_latest.at(out.src[0]), xfb_latest.at(out.src[1]));
+                    value = ir.BitCast<IR::F32>(ir.Pack2x16(AmdGpu::NumberFormat::Float, vec));
+                }
+                ir.SetAttribute(IR::Attribute::Param0 + static_cast<int>(copy_data.num_attrs + k),
+                                value, 0);
+            }
+        };
+
         ForEachInstruction([&](IR::IREmitter& ir, IR::Inst& inst) {
             const auto opcode = inst.GetOpcode();
             switch (opcode) {
@@ -137,7 +196,15 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
                 const auto output_size = gs_info.output_vertices * dwords_per_vertex * sizeof(u32);
 
                 const auto vc_read_ofs = (((offset / comp_ofs) * comp_ofs) % output_size) * 16u;
+                if (use_xfb) {
+                    capture_xfb(ir, vc_read_ofs, data);
+                }
                 const auto& it = info.gs_copy_data.attr_map.find(vc_read_ofs);
+                if (use_xfb && it == info.gs_copy_data.attr_map.cend()) {
+                    // Component only goes to the stream-out buffer.
+                    inst.Invalidate();
+                    break;
+                }
                 ASSERT(it != info.gs_copy_data.attr_map.cend());
                 const auto& [attr, comp] = it->second;
 

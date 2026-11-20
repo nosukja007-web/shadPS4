@@ -870,12 +870,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
             }
             case PM4ItOpcode::StrmoutBufferUpdate: {
                 const auto* strmout = reinterpret_cast<const PM4CmdStrmoutBufferUpdate*>(header);
-                LOG_WARNING(Render_Vulkan,
-                            "Unimplemented IT_STRMOUT_BUFFER_UPDATE, update_memory = {}, "
-                            "source_select = {}, buffer_select = {}",
-                            strmout->update_memory.Value(),
-                            magic_enum::enum_name(strmout->source_select.Value()),
-                            strmout->buffer_select.Value());
+                const auto source_select = strmout->source_select.Value();
+                const bool update_memory = strmout->update_memory.Value() != 0;
+                if (rasterizer) {
+                    rasterizer->StreamoutBufferUpdate(
+                        strmout->buffer_select.Value(), static_cast<u32>(source_select),
+                        update_memory, update_memory ? strmout->DstAddress<VAddr>() : 0,
+                        source_select == SourceSelect::SrcAddress ? strmout->SrcAddress<VAddr>()
+                                                                  : 0,
+                        strmout->buffer_offset);
+                } else {
+                    LOG_WARNING(Render_Vulkan,
+                                "Unimplemented IT_STRMOUT_BUFFER_UPDATE, update_memory = {}, "
+                                "source_select = {}, buffer_select = {}",
+                                strmout->update_memory.Value(),
+                                magic_enum::enum_name(source_select),
+                                strmout->buffer_select.Value());
+                }
                 break;
             }
             case PM4ItOpcode::GetLodStats: {

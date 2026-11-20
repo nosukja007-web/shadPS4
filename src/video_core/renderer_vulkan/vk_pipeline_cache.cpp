@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <mutex>
 #include <ranges>
+#include <unordered_set>
 
 #include "common/hash.h"
 #include "common/io_file.h"
@@ -9,6 +12,7 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
@@ -35,6 +39,20 @@ constexpr static std::array DescriptorHeapSizes = {
     vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage, 1024},
     vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 1024},
 };
+
+/// Stream-out of stream 0 to up to 4 buffers is emulated with VK_EXT_transform_feedback.
+/// Set SHADPS4_DISABLE_STREAMOUT=1 to fall back to skipping these draws.
+static bool IsStreamoutEmulated(const AmdGpu::Regs& regs, bool xfb_supported) {
+    static const bool disabled = std::getenv("SHADPS4_DISABLE_STREAMOUT") != nullptr;
+    const auto& cfg = regs.vgt_strmout_config;
+    if (!cfg.raw || disabled || !xfb_supported) {
+        return false;
+    }
+    if (cfg.streamout_1_en || cfg.streamout_2_en || cfg.streamout_3_en || !cfg.streamout_0_en) {
+        return false;
+    }
+    return regs.vgt_strmout_buffer_config.stream_0_buf_en != 0;
+}
 
 static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsOutputControl& ctl) {
     u32 num_outputs = 0;
@@ -150,6 +168,15 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         const auto params_vc = AmdGpu::GetParams(regs.vs_program);
         info.hw.gs.vs_copy = params_vc.code;
         info.hw.gs.vs_copy_hash = params_vc.hash;
+        if (IsStreamoutEmulated(regs, instance.IsTransformFeedbackSupported())) {
+            info.hw.gs.xfb_buffer_mask = regs.vgt_strmout_buffer_config.stream_0_buf_en;
+            for (u32 i = 0; i < 4; i++) {
+                if (info.hw.gs.xfb_buffer_mask & (1u << i)) {
+                    info.hw.gs.xfb_strides[i] = static_cast<u16>(
+                        regs.reg_array[AmdGpu::Regs::VgtStrmoutVtxStride0 + i * 4] * 4);
+                }
+            }
+        }
         DumpShader(info.hw.gs.vs_copy, info.hw.gs.vs_copy_hash, Shader::HwStage::Vertex, 0,
                    "copy.bin");
         break;
@@ -495,6 +522,94 @@ bool PipelineCache::RefreshGraphicsKey() {
     return true;
 }
 
+// Diagnostics for draws that use VGT stream-out (logged once per ES/GS/copy-shader combination).
+static void LogStreamoutDraw(const AmdGpu::Regs& regs) {
+    static std::mutex mutex;
+    static std::unordered_set<u64> seen;
+    const auto es = AmdGpu::GetParams(regs.es_program);
+    const auto gs = AmdGpu::GetParams(regs.gs_program);
+    const auto vc = AmdGpu::GetParams(regs.vs_program);
+    const u64 key = es.hash ^ (gs.hash * 31) ^ (vc.hash * 131) ^ regs.vgt_strmout_config.raw;
+    {
+        std::scoped_lock lk{mutex};
+        if (!seen.insert(key).second) {
+            return;
+        }
+    }
+    const auto& r = regs.reg_array;
+    LOG_WARNING(
+        Render_Vulkan,
+        "STRMOUT-DIAG draw: es={:#x} gs={:#x} copy_vs={:#x} stages={:#x} onchip={} "
+        "strmout_config={:#x} buffer_config={:#x} prim_type={} gs_out_prim={:#x} "
+        "max_vert_out={} gsvs_itemsize={} esgs_itemsize={} gs_instances={:#x} "
+        "pa_cl_clip_cntl={:#x} pa_su_sc_mode={:#x} pa_cl_vs_out_cntl={:#x} spi_vs_out_config={:#x}",
+        es.hash, gs.hash, vc.hash, u32(regs.stage_enable.raw), u32(regs.vgt_gs_mode.onchip),
+        regs.vgt_strmout_config.raw, r[0xA2E6], u32(regs.primitive_type), r[0xA29B],
+        u32(regs.vgt_gs_max_vert_out), regs.vgt_gs_vert_itemsize[0], regs.vgt_esgs_ring_itemsize,
+        r[0xA2E4], r[0xA204], r[0xA205], r[0xA207], r[0xA1B1]);
+    for (u32 i = 0; i < 4; i++) {
+        const u32 b = 0xA2B4 + i * 4;
+        LOG_WARNING(Render_Vulkan,
+                    "STRMOUT-DIAG   buf{}: size_dw={:#x} vtx_stride_dw={} base={:#x} offset={:#x}",
+                    i, r[b], r[b + 1], r[b + 2], r[b + 3]);
+    }
+    LOG_WARNING(Render_Vulkan,
+                "STRMOUT-DIAG   draw_opaque: offset={:#x} filled_size={:#x} vtx_stride={:#x}",
+                r[0xA2CA], r[0xA2CB], r[0xA2CC]);
+    const auto log_pgm = [&](const char* name, const AmdGpu::ShaderProgram& pgm) {
+        const u32* raw = reinterpret_cast<const u32*>(&pgm);
+        std::string ud;
+        for (u32 i = 0; i < 16; i++) {
+            ud += fmt::format(" {:08x}", pgm.user_data[i]);
+        }
+        LOG_WARNING(Render_Vulkan, "STRMOUT-DIAG   {}: addr={:#x} rsrc1={:#x} rsrc2={:#x} ud:{}",
+                    name, u64(pgm.address) << 8, raw[2], raw[3], ud);
+    };
+    log_pgm("es", regs.es_program);
+    log_pgm("gs", regs.gs_program);
+    log_pgm("vs(copy)", regs.vs_program);
+
+    // Dump the copy shader: raw dwords per decoded instruction, plus memory behind SMRD loads.
+    Shader::Gcn::GcnCodeSlice slice{vc.code.data(), vc.code.data() + vc.code.size()};
+    Shader::Gcn::GcnDecodeContext decoder;
+    u32 pc = 0;
+    while (!slice.atEnd()) {
+        const auto inst = decoder.decodeInstruction(slice);
+        const u32 len = inst.length / 4;
+        std::string words;
+        for (u32 i = 0; i < len && pc + i < vc.code.size(); i++) {
+            words += fmt::format(" {:08x}", vc.code[pc + i]);
+        }
+        std::string ops;
+        for (u32 i = 0; i < inst.dst_count; i++) {
+            ops += fmt::format(" d{}={}:{}", i, u32(inst.dst[i].field), inst.dst[i].code);
+        }
+        for (u32 i = 0; i < inst.src_count; i++) {
+            ops += fmt::format(" s{}={}:{}", i, u32(inst.src[i].field), inst.src[i].code);
+        }
+        LOG_WARNING(Render_Vulkan, "STRMOUT-DIAG   copy[{:4}] op={} enc={}{} |{}", pc,
+                    u32(inst.opcode), u32(inst.encoding), ops, words);
+        if (inst.inst_class == Shader::Gcn::InstClass::ScalarMemRd) {
+            const u32 sbase = inst.src[0].code * 2;
+            if (sbase + 1 < 16) {
+                const u64 ptr = (u64(regs.vs_program.user_data[sbase]) |
+                                 (u64(regs.vs_program.user_data[sbase + 1]) << 32)) &
+                                0xFFFFFFFFFFull;
+                if (ptr > 0x10000 && ptr < 0x10000000000ull) {
+                    const u32* mem = reinterpret_cast<const u32*>(ptr);
+                    std::string m;
+                    for (u32 i = 0; i < 32; i++) {
+                        m += fmt::format(" {:08x}", mem[i]);
+                    }
+                    LOG_WARNING(Render_Vulkan, "STRMOUT-DIAG     mem[ud{}={:#x}]:{}", sbase, ptr,
+                                m);
+                }
+            }
+        }
+        pc += len;
+    }
+}
+
 bool PipelineCache::RefreshGraphicsStages() {
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
@@ -538,7 +653,12 @@ bool PipelineCache::RefreshGraphicsStages() {
             LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
             return false;
         }
-        if (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw) {
+        if (regs.vgt_strmout_config.raw) {
+            LogStreamoutDraw(regs);
+        }
+        if (regs.vgt_gs_mode.onchip ||
+            (regs.vgt_strmout_config.raw &&
+             !IsStreamoutEmulated(regs, instance.IsTransformFeedbackSupported()))) {
             LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
             return false;
         }
@@ -571,7 +691,12 @@ bool PipelineCache::RefreshGraphicsStages() {
             LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
             return false;
         }
-        if (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw) {
+        if (regs.vgt_strmout_config.raw) {
+            LogStreamoutDraw(regs);
+        }
+        if (regs.vgt_gs_mode.onchip ||
+            (regs.vgt_strmout_config.raw &&
+             !IsStreamoutEmulated(regs, instance.IsTransformFeedbackSupported()))) {
             LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
             return false;
         }

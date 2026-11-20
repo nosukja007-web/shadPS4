@@ -757,6 +757,21 @@ void EmitContext::DefineOutputs() {
             Name(id, fmt::format("out_attr{}", attr_id));
             output_params[attr_id] = GetAttributeInfo(AmdGpu::NumberFormat::Float, id, 4, true);
         }
+        if (info.gs_copy_data.xfb_active) {
+            // One scalar output per captured dword, decorated for transform feedback.
+            const auto& xfb_outputs = info.gs_copy_data.xfb_outputs;
+            for (u32 k = 0; k < xfb_outputs.size(); k++) {
+                const auto& out = xfb_outputs[k];
+                const u32 index = info.gs_copy_data.num_attrs + k;
+                const Id id{DefineOutput(U32[1], index)};
+                Name(id, fmt::format("out_xfb{}_b{}_o{}", k, out.buffer, out.offset));
+                Decorate(id, spv::Decoration::XfbBuffer, out.buffer);
+                Decorate(id, spv::Decoration::XfbStride,
+                         runtime_info.hw.gs.xfb_strides[out.buffer]);
+                Decorate(id, spv::Decoration::Offset, out.offset);
+                output_params[index] = GetAttributeInfo(AmdGpu::NumberFormat::Uint, id, 1, true);
+            }
+        }
         break;
     }
     case SwStage::Compute:
@@ -768,10 +783,9 @@ void EmitContext::DefineOutputs() {
 
 void EmitContext::DefinePushDataBlock() {
     // Create push constants block for instance steps rates
-    const Id struct_type{
-        Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2], F32[1], U32[1],
-                        U32[4]),
-             "AuxData")};
+    const Id struct_type{Name(
+        TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2], F32[1], U32[1], U32[4]),
+        "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
     MemberName(struct_type, PushData::XOffsetIndex, "xoffset");
     MemberName(struct_type, PushData::YOffsetIndex, "yoffset");

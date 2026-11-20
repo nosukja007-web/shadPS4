@@ -101,6 +101,16 @@ public:
         return key;
     }
 
+    /// Stream-out buffers written by the geometry stage through transform feedback.
+    u32 GetXfbBufferMask() const noexcept {
+        return xfb_buffer_mask;
+    }
+
+    /// Stream-out vertex strides in bytes.
+    const std::array<u16, 4>& GetXfbStrides() const noexcept {
+        return xfb_strides;
+    }
+
     /// Gets the attributes and bindings for vertex inputs.
     template <typename Attribute, typename Binding>
     void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
@@ -114,6 +124,8 @@ private:
 private:
     GraphicsPipelineKey key;
     Shader::Gcn::FetchShaderData fetch_shader{};
+    u32 xfb_buffer_mask{};
+    std::array<u16, 4> xfb_strides{};
 };
 
 struct ClipDistanceShaderKey {

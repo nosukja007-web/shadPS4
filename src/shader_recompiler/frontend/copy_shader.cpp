@@ -22,6 +22,55 @@ CopyShaderData ParseCopyShader(std::span<const u32> code) {
 
     CopyShaderData data{};
     auto last_attr{IR::Attribute::Position0};
+
+    // Stream-out tracking: provenance of VGPR values and sources of SGPR V#s.
+    struct VgprSource {
+        enum class Kind { None, Ring, PackHalf } kind{Kind::None};
+        std::array<u32, 2> ring{};
+    };
+    std::array<VgprSource, 256> vgpr_src{};
+    struct SgprSharp {
+        s32 table_sgpr{-1};
+        u32 dword_offset{};
+    };
+    std::array<SgprSharp, 128> sgpr_sharp{};
+    const auto is_vgpr = [](const Gcn::InstOperand& op) {
+        return op.field == Gcn::OperandField::VectorGPR && op.code < 256;
+    };
+    const auto add_xfb_store = [&](const Gcn::GcnInst& inst, u32 num_dwords) {
+        const u32 sharp_sgpr = inst.src[2].code * 4;
+        const auto& sharp = sharp_sgpr < sgpr_sharp.size() ? sgpr_sharp[sharp_sgpr] : SgprSharp{};
+        u32 buffer = 0;
+        CopyShaderXfbBuffer buf_src{};
+        if (sharp.table_sgpr >= 0) {
+            buffer = sharp.dword_offset / 4;
+            buf_src.table_sgpr = sharp.table_sgpr;
+            buf_src.table_dword_offset = sharp.dword_offset;
+        } else {
+            buf_src.direct_sgpr = static_cast<s32>(sharp_sgpr);
+        }
+        if (buffer >= 4) {
+            data.xfb_parse_failed = true;
+            return;
+        }
+        data.xfb_buffers[buffer] = buf_src;
+        data.xfb_buffer_mask |= 1u << buffer;
+        for (u32 i = 0; i < num_dwords; i++) {
+            const u32 vgpr = inst.src[1].code + i;
+            const auto& src = vgpr < vgpr_src.size() ? vgpr_src[vgpr] : VgprSource{};
+            if (inst.src[1].field != Gcn::OperandField::VectorGPR ||
+                src.kind == VgprSource::Kind::None) {
+                data.xfb_parse_failed = true;
+                continue;
+            }
+            data.xfb_outputs.push_back(CopyShaderXfbOutput{
+                .buffer = buffer,
+                .offset = static_cast<u32>(inst.control.mubuf.offset) + i * 4,
+                .pack_half = src.kind == VgprSource::Kind::PackHalf,
+                .src = src.ring,
+            });
+        }
+    };
     while (!code_slice.atEnd()) {
         auto inst = decoder.decodeInstruction(code_slice);
         switch (inst.opcode) {
@@ -79,9 +128,56 @@ CopyShaderData ParseCopyShader(std::span<const u32> code) {
                 ASSERT(sources[index] != -1);
                 offsets[inst.src[1].code] += sources[index];
             }
+            vgpr_src[inst.src[1].code] = {VgprSource::Kind::Ring,
+                                          {static_cast<u32>(offsets[inst.src[1].code]), 0}};
             data.num_comps++;
             break;
         }
+        case Gcn::Opcode::V_MOV_B32: {
+            if (is_vgpr(inst.dst[0])) {
+                vgpr_src[inst.dst[0].code] =
+                    is_vgpr(inst.src[0]) ? vgpr_src[inst.src[0].code] : VgprSource{};
+            }
+            break;
+        }
+        case Gcn::Opcode::V_CVT_PKRTZ_F16_F32: {
+            if (is_vgpr(inst.dst[0])) {
+                VgprSource src{};
+                if (is_vgpr(inst.src[0]) && is_vgpr(inst.src[1]) &&
+                    vgpr_src[inst.src[0].code].kind == VgprSource::Kind::Ring &&
+                    vgpr_src[inst.src[1].code].kind == VgprSource::Kind::Ring) {
+                    src.kind = VgprSource::Kind::PackHalf;
+                    src.ring = {vgpr_src[inst.src[0].code].ring[0],
+                                vgpr_src[inst.src[1].code].ring[0]};
+                }
+                vgpr_src[inst.dst[0].code] = src;
+            }
+            break;
+        }
+        case Gcn::Opcode::S_LOAD_DWORDX4: {
+            const u32 dst = inst.dst[0].code;
+            if (dst < sgpr_sharp.size() && inst.control.smrd.imm) {
+                sgpr_sharp[dst] = {static_cast<s32>(inst.src[0].code * 2),
+                                   static_cast<u32>(inst.control.smrd.offset)};
+            }
+            break;
+        }
+        case Gcn::Opcode::BUFFER_STORE_DWORD:
+        case Gcn::Opcode::TBUFFER_STORE_FORMAT_X:
+            add_xfb_store(inst, 1);
+            break;
+        case Gcn::Opcode::BUFFER_STORE_DWORDX2:
+        case Gcn::Opcode::TBUFFER_STORE_FORMAT_XY:
+            add_xfb_store(inst, 2);
+            break;
+        case Gcn::Opcode::BUFFER_STORE_DWORDX3:
+        case Gcn::Opcode::TBUFFER_STORE_FORMAT_XYZ:
+            add_xfb_store(inst, 3);
+            break;
+        case Gcn::Opcode::BUFFER_STORE_DWORDX4:
+        case Gcn::Opcode::TBUFFER_STORE_FORMAT_XYZW:
+            add_xfb_store(inst, 4);
+            break;
         default:
             break;
         }

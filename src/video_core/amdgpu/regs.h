@@ -22,6 +22,10 @@ union Regs {
     static constexpr u32 UconfigRegWordOffset = 0xC000;
     static constexpr u32 ContextRegWordOffset = 0xA000;
     static constexpr u32 ConfigRegWordOffset = 0x2000;
+    static constexpr u32 VgtStrmoutBufferSize0 = 0xA2B4;   ///< Per buffer, stride 4 regs (dwords)
+    static constexpr u32 VgtStrmoutVtxStride0 = 0xA2B5;    ///< Per buffer, stride 4 regs (dwords)
+    static constexpr u32 VgtStrmoutBufferBase0 = 0xA2B6;   ///< Per buffer, stride 4 regs
+    static constexpr u32 VgtStrmoutBufferOffset0 = 0xA2B7; ///< Per buffer, stride 4 regs (dwords)
     static constexpr u32 ShRegWordOffset = 0x2C00;
 
     struct {

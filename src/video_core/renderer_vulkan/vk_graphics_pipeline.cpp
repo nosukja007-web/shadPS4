@@ -38,6 +38,11 @@ GraphicsPipeline::GraphicsPipeline(
     if (fetch_shader_) {
         fetch_shader = *fetch_shader_;
     }
+    if (infos[u32(Shader::SwStage::Geometry)]) {
+        const auto& gs = runtime_infos[u32(Shader::SwStage::Geometry)].hw.gs;
+        xfb_buffer_mask = gs.xfb_buffer_mask;
+        xfb_strides = gs.xfb_strides;
+    }
 
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());

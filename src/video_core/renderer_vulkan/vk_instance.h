@@ -269,6 +269,11 @@ public:
         return features.geometryShader;
     }
 
+    /// Returns true when VK_EXT_transform_feedback is supported and enabled
+    bool IsTransformFeedbackSupported() const {
+        return transform_feedback;
+    }
+
     /// Returns true when tessellation is supported by the device
     bool IsTessellationSupported() const {
         return features.tessellationShader;
@@ -536,6 +541,7 @@ private:
     bool vertex_input_dynamic_state{};
     bool list_restart{};
     bool provoking_vertex{};
+    bool transform_feedback{};
     bool shader_stencil_export{};
     bool image_load_store_lod{};
     bool amd_gcn_shader{};

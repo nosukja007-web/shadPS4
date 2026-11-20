@@ -256,9 +256,9 @@ VideoCore::UniqueImage Runtime::CreateNativeStaging(const VideoCore::Image* imag
     return staging;
 }
 
-void Runtime::TransitStaging(vk::Image image, vk::ImageAspectFlags aspect, vk::ImageLayout old_layout,
-                             vk::ImageLayout new_layout, vk::AccessFlags2 src_access,
-                             vk::AccessFlags2 dst_access) {
+void Runtime::TransitStaging(vk::Image image, vk::ImageAspectFlags aspect,
+                             vk::ImageLayout old_layout, vk::ImageLayout new_layout,
+                             vk::AccessFlags2 src_access, vk::AccessFlags2 dst_access) {
     const vk::ImageMemoryBarrier2 barrier = {
         .srcStageMask = vk::PipelineStageFlagBits2::eAllTransfer,
         .srcAccessMask = src_access,
@@ -341,10 +341,9 @@ void Runtime::DownloadScaledImage(VideoCore::Image* src, const VideoCore::Buffer
     TransitStaging(staging.image, aspect, vk::ImageLayout::eUndefined,
                    vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eNone,
                    vk::AccessFlagBits2::eTransferWrite);
-    const auto blits = MakeScaleBlits(aspect, src->info.resources.levels, 0, 0,
-                                      src->info.resources.layers, src->HostWidth(),
-                                      src->HostHeight(), src->info.size.width,
-                                      src->info.size.height);
+    const auto blits = MakeScaleBlits(
+        aspect, src->info.resources.levels, 0, 0, src->info.resources.layers, src->HostWidth(),
+        src->HostHeight(), src->info.size.width, src->info.size.height);
     cmdbuf.blitImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, staging.image,
                      vk::ImageLayout::eTransferDstOptimal, blits, ScaleFilter(src));
     TransitStaging(staging.image, aspect, vk::ImageLayout::eTransferDstOptimal,
@@ -736,8 +735,8 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
         }
 
         blit_helper->ReinterpretColorAsMsDepth(
-            dst->HostWidth(), dst->HostHeight(), dst->info.num_samples,
-            src->info.pixel_format, dst->info.pixel_format, src->GetImage(), dst->GetImage());
+            dst->HostWidth(), dst->HostHeight(), dst->info.num_samples, src->info.pixel_format,
+            dst->info.pixel_format, src->GetImage(), dst->GetImage());
     } else {
         LOG_WARNING(Render_Vulkan, "Unimplemented depth overlap copy");
     }
@@ -943,9 +942,9 @@ void Runtime::ResolveScaledImage(VideoCore::Image* src, VideoCore::Image* dst, u
     const u32 dst_height = std::min(src->info.size.height * dst->scale, dst->HostHeight());
 
     if (!needs_resolve) {
-        const auto blits = MakeScaleBlits(aspect, 1, src_layer, dst_layer, num_layers,
-                                          src->HostWidth(), src->HostHeight(), dst_width,
-                                          dst_height);
+        const auto blits =
+            MakeScaleBlits(aspect, 1, src_layer, dst_layer, num_layers, src->HostWidth(),
+                           src->HostHeight(), dst_width, dst_height);
         cmdbuf.blitImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
                          vk::ImageLayout::eTransferDstOptimal, blits, ScaleFilter(dst));
         return;
@@ -1119,12 +1118,13 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eUniformRead | vk::AccessFlagBits2::eShaderRead |
         vk::AccessFlagBits2::eColorAttachmentRead |
         vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eTransferRead |
-        vk::AccessFlagBits2::eMemoryRead;
+        vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eTransformFeedbackCounterReadEXT;
 
     constexpr static vk::AccessFlags2 WRITE_MASK =
         vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eColorAttachmentWrite |
         vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
-        vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
+        vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT |
+        vk::AccessFlagBits2::eTransformFeedbackCounterWriteEXT;
 
     if (src_access & WRITE_MASK) {
         resource->write_ranges.Add(range);

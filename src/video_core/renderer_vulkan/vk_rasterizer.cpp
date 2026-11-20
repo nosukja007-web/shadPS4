@@ -213,6 +213,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (is_indexed) {
         BindIndexBuffer(index_offset);
     }
+    const bool use_xfb = PrepareTransformFeedback(pipeline);
 
     if (needs_barrier) {
         runtime.FlushBarriers();
@@ -228,6 +229,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    if (use_xfb) {
+        BeginTransformFeedback();
+    }
 
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
@@ -235,6 +239,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     } else {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
                     instance_offset);
+    }
+    if (use_xfb) {
+        EndTransformFeedback();
     }
     DebugState.IncDrawCall();
 
@@ -287,6 +294,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         bound_buffers.emplace_back(count_buffer, count_offset, 4,
                                    vk::AccessFlagBits2::eIndirectCommandRead);
     }
+    const bool use_xfb = PrepareTransformFeedback(pipeline);
 
     if (needs_barrier) {
         runtime.FlushBarriers();
@@ -298,6 +306,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    if (use_xfb) {
+        BeginTransformFeedback();
+    }
 
     if (is_indexed) {
         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
@@ -319,6 +330,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             cmdbuf.drawIndirect(buffer->Handle(), base, max_count, stride);
         }
         DebugState.IncDrawCall();
+    }
+    if (use_xfb) {
+        EndTransformFeedback();
     }
 
     ResetBindings(false);
@@ -935,8 +949,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                                  "Stencil read through T# address={:#x} data_format={} "
                                  "num_format={} view_format={} storage={} depth_samples={}",
                                  tsharp.Address(), magic_enum::enum_name(data_fmt),
-                                 magic_enum::enum_name(num_fmt), vk::to_string(desc.view_info.format),
-                                 image_desc.is_written, image->info.num_samples);
+                                 magic_enum::enum_name(num_fmt),
+                                 vk::to_string(desc.view_info.format), image_desc.is_written,
+                                 image->info.num_samples);
                     }
                 }
                 // Vulkan only allows reading the stencil aspect with an unsigned integer sampled
@@ -1755,5 +1770,203 @@ u32 Rasterizer::GetGpuCommandProcessorThreadId() {
     return liverpool->GetGpuCommandProcessorThreadId();
 }
 #endif
+
+VideoCore::Buffer* Rasterizer::GetXfbCounterBuffer() {
+    if (!xfb_counter_buffer) {
+        xfb_counter_buffer = std::make_unique<VideoCore::Buffer>(instance, 0, 4 * sizeof(u32),
+                                                                 VideoCore::MemoryType::DeviceLocal,
+                                                                 "Stream-out counters");
+    }
+    return xfb_counter_buffer.get();
+}
+
+bool Rasterizer::PrepareTransformFeedback(const GraphicsPipeline* pipeline) {
+    xfb_active_mask = 0;
+    const u32 mask = pipeline->GetXfbBufferMask();
+    if (!mask) {
+        return false;
+    }
+    const auto& regs = liverpool->regs;
+
+    // The copy shader tells where the stream-out V#s come from (cached by hash).
+    const auto vc = AmdGpu::GetParams(regs.vs_program);
+    auto it = xfb_copy_shaders.find(vc.hash);
+    if (it == xfb_copy_shaders.end()) {
+        it = xfb_copy_shaders.emplace(vc.hash, Shader::ParseCopyShader(vc.code)).first;
+        const auto& data = it->second;
+        LOG_INFO(Render_Vulkan,
+                 "Stream-out copy shader {:#x}: buffers={:#x} outputs={} attrs={} failed={}",
+                 vc.hash, data.xfb_buffer_mask, data.xfb_outputs.size(), data.num_attrs,
+                 data.xfb_parse_failed);
+        for (const auto& out : data.xfb_outputs) {
+            LOG_INFO(Render_Vulkan, "  buf{} +{}: {} ring {:#x}/{:#x}", out.buffer, out.offset,
+                     out.pack_half ? "pkrtz" : "dword", out.src[0], out.src[1]);
+        }
+        for (u32 i = 0; i < 4; i++) {
+            const auto& b = data.xfb_buffers[i];
+            if (data.xfb_buffer_mask & (1u << i)) {
+                LOG_INFO(Render_Vulkan, "  buf{} V#: table_sgpr={} dword_off={} direct_sgpr={}", i,
+                         b.table_sgpr, b.table_dword_offset, b.direct_sgpr);
+            }
+        }
+    }
+    const auto& copy_data = it->second;
+    if (copy_data.xfb_parse_failed || copy_data.xfb_outputs.empty() ||
+        copy_data.num_attrs + copy_data.xfb_outputs.size() > Shader::IR::NumParams) {
+        return false;
+    }
+
+    auto* counter = GetXfbCounterBuffer();
+    for (u32 i = 0; i < 4; i++) {
+        if (!(mask & copy_data.xfb_buffer_mask & (1u << i))) {
+            continue;
+        }
+        const auto& src = copy_data.xfb_buffers[i];
+        AmdGpu::Buffer vsharp{};
+        if (src.table_sgpr >= 0 && src.table_sgpr + 1 < 16) {
+            const u64 table = (u64(regs.vs_program.user_data[src.table_sgpr]) |
+                               (u64(regs.vs_program.user_data[src.table_sgpr + 1]) << 32)) &
+                              0xFFFFFFFFFFull;
+            if (!table) {
+                continue;
+            }
+            std::memcpy(&vsharp, reinterpret_cast<const u32*>(table) + src.table_dword_offset,
+                        sizeof(vsharp));
+        } else if (src.direct_sgpr >= 0 && src.direct_sgpr + 4 <= 16) {
+            std::memcpy(&vsharp, &regs.vs_program.user_data[src.direct_sgpr], sizeof(vsharp));
+        } else {
+            continue;
+        }
+        const VAddr base = vsharp.base_address;
+        const u32 size_reg = regs.reg_array[AmdGpu::Regs::VgtStrmoutBufferSize0 + i * 4] * 4;
+        u64 size = size_reg ? size_reg : vsharp.GetSize();
+        if (!base || !size) {
+            continue;
+        }
+        size = memory->ClampRangeSize(base, size) & ~3ull;
+        if (!size) {
+            continue;
+        }
+        static std::unordered_set<u64> logged;
+        if (logged.insert(base ^ (u64(i) << 60)).second) {
+            LOG_INFO(Render_Vulkan,
+                     "Stream-out buffer {}: base={:#x} size={:#x} (reg {:#x}, v# {:#x}) "
+                     "stride={} bytes",
+                     i, base, size, size_reg, vsharp.GetSize(), pipeline->GetXfbStrides()[i]);
+        }
+        const auto [buffer, offset] = buffer_cache.ObtainBuffer(
+            base, static_cast<u32>(size), VideoCore::ObtainBufferFlags::IsWritten);
+        texture_cache.InvalidateMemoryFromGPU(base, size);
+        needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, true);
+        bound_buffers.emplace_back(buffer, offset, static_cast<u32>(size),
+                                   vk::AccessFlagBits2::eTransformFeedbackWriteEXT);
+        xfb_bindings[i] = {buffer->Handle(), offset, size};
+
+        if (xfb_counter_init_mask & (1u << i)) {
+            runtime.InlineData(counter, i * sizeof(u32), xfb_counter_init_value[i]);
+            xfb_counter_init_mask &= ~(1u << i);
+        }
+        needs_barrier |= runtime.IsBufferAccessed(counter, i * sizeof(u32), sizeof(u32), true);
+        xfb_active_mask |= 1u << i;
+    }
+    return xfb_active_mask != 0;
+}
+
+void Rasterizer::BeginTransformFeedback() {
+    const auto cmdbuf = scheduler.CommandBuffer();
+    const vk::Buffer counter = GetXfbCounterBuffer()->Handle();
+    std::array<vk::Buffer, 4> counters{};
+    std::array<vk::DeviceSize, 4> counter_offsets{};
+    u32 count = 0;
+    for (u32 i = 0; i < 4; i++) {
+        if (!(xfb_active_mask & (1u << i))) {
+            continue;
+        }
+        const auto& b = xfb_bindings[i];
+        cmdbuf.bindTransformFeedbackBuffersEXT(i, 1, &b.buffer, &b.offset, &b.size);
+        counters[i] = counter;
+        counter_offsets[i] = i * sizeof(u32);
+        count = i + 1;
+    }
+    cmdbuf.beginTransformFeedbackEXT(0, count, counters.data(), counter_offsets.data());
+}
+
+void Rasterizer::EndTransformFeedback() {
+    const auto cmdbuf = scheduler.CommandBuffer();
+    auto* counter = GetXfbCounterBuffer();
+    const vk::Buffer counter_handle = counter->Handle();
+    std::array<vk::Buffer, 4> counters{};
+    std::array<vk::DeviceSize, 4> counter_offsets{};
+    u32 count = 0;
+    for (u32 i = 0; i < 4; i++) {
+        if (!(xfb_active_mask & (1u << i))) {
+            continue;
+        }
+        counters[i] = counter_handle;
+        counter_offsets[i] = i * sizeof(u32);
+        count = i + 1;
+    }
+    cmdbuf.endTransformFeedbackEXT(0, count, counters.data(), counter_offsets.data());
+    for (u32 i = 0; i < 4; i++) {
+        if (xfb_active_mask & (1u << i)) {
+            runtime.AccessBuffer(counter, i * sizeof(u32), sizeof(u32),
+                                 vk::PipelineStageFlagBits2::eTransformFeedbackEXT,
+                                 vk::AccessFlagBits2::eTransformFeedbackCounterWriteEXT);
+        }
+    }
+    xfb_active_mask = 0;
+}
+
+void Rasterizer::StreamoutBufferUpdate(u32 buffer, u32 source_select, bool update_memory,
+                                       VAddr dst_addr, VAddr src_addr, u32 offset_dw) {
+    if (!instance.IsTransformFeedbackSupported() || buffer >= 4) {
+        return;
+    }
+    auto* counter = GetXfbCounterBuffer();
+    if (update_memory && dst_addr) {
+        // BUFFER_FILLED_SIZE (bytes) as tracked by the transform feedback counter.
+        if (xfb_counter_init_mask & (1u << buffer)) {
+            runtime.InlineData(counter, buffer * sizeof(u32), xfb_counter_init_value[buffer]);
+            xfb_counter_init_mask &= ~(1u << buffer);
+        }
+        texture_cache.InvalidateMemoryFromGPU(dst_addr, sizeof(u32));
+        const auto [dst_buffer, dst_offset] = buffer_cache.ObtainBuffer(
+            dst_addr, sizeof(u32),
+            VideoCore::ObtainBufferFlags::IsWritten | VideoCore::ObtainBufferFlags::IsTexelBuffer);
+        const vk::BufferCopy copy = {
+            .srcOffset = buffer * sizeof(u32),
+            .dstOffset = dst_offset,
+            .size = sizeof(u32),
+        };
+        runtime.CopyBuffer(counter, dst_buffer, std::span{&copy, 1});
+    }
+    switch (source_select) {
+    case 0: // BufferOffset: offset from the packet, in dwords.
+        xfb_counter_init_value[buffer] = offset_dw * 4;
+        xfb_counter_init_mask |= 1u << buffer;
+        break;
+    case 1: // VgtStrmoutBufferFilledSize: keep appending after the previous data.
+        break;
+    case 2: { // SrcAddress: offset read from memory.
+        if (!buffer_cache.IsRegionGpuModified(src_addr, sizeof(u32))) {
+            xfb_counter_init_value[buffer] = *reinterpret_cast<const u32*>(src_addr);
+            xfb_counter_init_mask |= 1u << buffer;
+        } else {
+            const auto [src_buffer, src_offset] = buffer_cache.ObtainBuffer(
+                src_addr, sizeof(u32), VideoCore::ObtainBufferFlags::IsTexelBuffer);
+            const vk::BufferCopy copy = {
+                .srcOffset = src_offset,
+                .dstOffset = buffer * sizeof(u32),
+                .size = sizeof(u32),
+            };
+            runtime.CopyBuffer(src_buffer, counter, std::span{&copy, 1});
+            xfb_counter_init_mask &= ~(1u << buffer);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
 
 } // namespace Vulkan
