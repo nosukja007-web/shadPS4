@@ -1784,6 +1784,13 @@ bool Rasterizer::PrepareTransformFeedback(const GraphicsPipeline* pipeline) {
     xfb_active_mask = 0;
     const u32 mask = pipeline->GetXfbBufferMask();
     if (!mask) {
+        static bool warned = false;
+        if (!warned && liverpool->regs.vgt_strmout_config.raw &&
+            pipeline->GetGraphicsKey().stage_hashes[u32(Shader::SwStage::Geometry)] != 0) {
+            warned = true;
+            Shader::XfbTrace("WARNING: stream-out draw with a pipeline that has no xfb mask");
+            LOG_ERROR(Render_Vulkan, "Stream-out draw with a pipeline that has no xfb mask");
+        }
         return false;
     }
     const auto& regs = liverpool->regs;
