@@ -6,6 +6,7 @@
 #include <array>
 #include <map>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "common/types.h"
@@ -41,5 +42,10 @@ struct CopyShaderData {
 };
 
 CopyShaderData ParseCopyShader(std::span<const u32> code);
+
+/// Appends a line to log/strmout_trace.txt and flushes it (survives crashes).
+void XfbTrace(std::string_view line);
+/// Writes a binary blob to log/<name> (overwrites).
+void XfbDumpBinary(std::string_view name, std::span<const u32> code);
 
 } // namespace Shader

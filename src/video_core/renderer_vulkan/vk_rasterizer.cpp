@@ -1827,11 +1827,12 @@ bool Rasterizer::PrepareTransformFeedback(const GraphicsPipeline* pipeline) {
             const u64 table = (u64(regs.vs_program.user_data[src.table_sgpr]) |
                                (u64(regs.vs_program.user_data[src.table_sgpr + 1]) << 32)) &
                               0xFFFFFFFFFFull;
-            if (!table) {
+            const VAddr sharp_addr = table + src.table_dword_offset * sizeof(u32);
+            if (!table || !memory->IsValidMapping(sharp_addr, sizeof(vsharp))) {
+                Shader::XfbTrace(fmt::format("xfb buf{}: bad V# table {:#x}", i, table));
                 continue;
             }
-            std::memcpy(&vsharp, reinterpret_cast<const u32*>(table) + src.table_dword_offset,
-                        sizeof(vsharp));
+            std::memcpy(&vsharp, reinterpret_cast<const void*>(sharp_addr), sizeof(vsharp));
         } else if (src.direct_sgpr >= 0 && src.direct_sgpr + 4 <= 16) {
             std::memcpy(&vsharp, &regs.vs_program.user_data[src.direct_sgpr], sizeof(vsharp));
         } else {
@@ -1849,6 +1850,10 @@ bool Rasterizer::PrepareTransformFeedback(const GraphicsPipeline* pipeline) {
         }
         static std::unordered_set<u64> logged;
         if (logged.insert(base ^ (u64(i) << 60)).second) {
+            Shader::XfbTrace(fmt::format("xfb buf{}: base={:#x} size={:#x} reg={:#x} v#size={:#x} "
+                                         "stride={}",
+                                         i, base, size, size_reg, vsharp.GetSize(),
+                                         pipeline->GetXfbStrides()[i]));
             LOG_INFO(Render_Vulkan,
                      "Stream-out buffer {}: base={:#x} size={:#x} (reg {:#x}, v# {:#x}) "
                      "stride={} bytes",
@@ -1872,7 +1877,14 @@ bool Rasterizer::PrepareTransformFeedback(const GraphicsPipeline* pipeline) {
     return xfb_active_mask != 0;
 }
 
+static u32 xfb_trace_draws = 0;
+
 void Rasterizer::BeginTransformFeedback() {
+    if (xfb_trace_draws < 16) {
+        Shader::XfbTrace(fmt::format("xfb draw {} begin mask={:#x} off={:#x} size={:#x}",
+                                     xfb_trace_draws, xfb_active_mask, xfb_bindings[0].offset,
+                                     xfb_bindings[0].size));
+    }
     const auto cmdbuf = scheduler.CommandBuffer();
     const vk::Buffer counter = GetXfbCounterBuffer()->Handle();
     std::array<vk::Buffer, 4> counters{};
@@ -1907,6 +1919,10 @@ void Rasterizer::EndTransformFeedback() {
         count = i + 1;
     }
     cmdbuf.endTransformFeedbackEXT(0, count, counters.data(), counter_offsets.data());
+    if (xfb_trace_draws < 16) {
+        Shader::XfbTrace(fmt::format("xfb draw {} end", xfb_trace_draws));
+        ++xfb_trace_draws;
+    }
     for (u32 i = 0; i < 4; i++) {
         if (xfb_active_mask & (1u << i)) {
             runtime.AccessBuffer(counter, i * sizeof(u32), sizeof(u32),
@@ -1921,6 +1937,14 @@ void Rasterizer::StreamoutBufferUpdate(u32 buffer, u32 source_select, bool updat
                                        VAddr dst_addr, VAddr src_addr, u32 offset_dw) {
     if (!instance.IsTransformFeedbackSupported() || buffer >= 4) {
         return;
+    }
+    static u32 traced = 0;
+    if (traced < 16) {
+        ++traced;
+        Shader::XfbTrace(fmt::format("STRMOUT_BUFFER_UPDATE buf={} src={} mem={} dst={:#x} "
+                                     "src_addr={:#x} offset_dw={:#x}",
+                                     buffer, source_select, update_memory, dst_addr, src_addr,
+                                     offset_dw));
     }
     auto* counter = GetXfbCounterBuffer();
     if (update_memory && dst_addr) {

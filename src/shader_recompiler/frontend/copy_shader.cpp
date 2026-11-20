@@ -1,11 +1,36 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include <mutex>
+#include "common/path_util.h"
 #include "shader_recompiler/frontend/copy_shader.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/ir/attribute.h"
 
 namespace Shader {
+
+void XfbTrace(std::string_view line) {
+    static std::mutex mutex;
+    static std::FILE* file = [] {
+        const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "strmout_trace.txt";
+        return _wfopen(path.c_str(), L"w");
+    }();
+    std::scoped_lock lk{mutex};
+    if (file) {
+        std::fwrite(line.data(), 1, line.size(), file);
+        std::fputc('\n', file);
+        std::fflush(file);
+    }
+}
+
+void XfbDumpBinary(std::string_view name, std::span<const u32> code) {
+    const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / std::string{name};
+    if (std::FILE* f = _wfopen(path.c_str(), L"wb")) {
+        std::fwrite(code.data(), sizeof(u32), code.size(), f);
+        std::fclose(f);
+    }
+}
 
 CopyShaderData ParseCopyShader(std::span<const u32> code) {
     Gcn::GcnCodeSlice code_slice{code.data(), code.data() + code.size()};
@@ -75,8 +100,15 @@ CopyShaderData ParseCopyShader(std::span<const u32> code) {
         auto inst = decoder.decodeInstruction(code_slice);
         switch (inst.opcode) {
         case Gcn::Opcode::S_LSHL_B32: {
-            ASSERT(inst.src[0].field == Gcn::OperandField::SignedConstIntPos &&
-                   inst.src[1].field == Gcn::OperandField::SignedConstIntPos);
+            // Stream-out copy shaders also shift SGPRs (e.g. so_offset * 4); only constant
+            // shifts feed the ring offsets.
+            if (inst.src[0].field != Gcn::OperandField::SignedConstIntPos ||
+                inst.src[1].field != Gcn::OperandField::SignedConstIntPos) {
+                if (inst.dst[0].code < sources.size()) {
+                    sources[inst.dst[0].code] = -1;
+                }
+                break;
+            }
             sources[inst.dst[0].code] =
                 (inst.src[0].code - Gcn::OperandFieldRange::SignedConstIntPosMin + 1)
                 << (inst.src[1].code - Gcn::OperandFieldRange::SignedConstIntPosMin + 1);

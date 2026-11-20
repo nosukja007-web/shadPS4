@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <map>
 #include <vector>
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "shader_recompiler/frontend/copy_shader.h"
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/opcodes.h"
 #include "shader_recompiler/ir/operand_helper.h"
@@ -117,6 +119,22 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
                       copy_data.xfb_outputs.size(), copy_data.num_attrs);
         }
         copy_data.xfb_active = use_xfb;
+        if (gs_info.xfb_buffer_mask != 0) {
+            XfbTrace(fmt::format("GS ring pass: copy={:#x} use_xfb={} outputs={} attrs={} "
+                                 "attr_map={} out_vertices={} failed={}",
+                                 gs_info.vs_copy_hash, use_xfb, copy_data.xfb_outputs.size(),
+                                 copy_data.num_attrs, copy_data.attr_map.size(),
+                                 copy_data.output_vertices, copy_data.xfb_parse_failed));
+            for (const auto& out : copy_data.xfb_outputs) {
+                XfbTrace(fmt::format("  xfb out buf{} +{} {} src {:#x}/{:#x}", out.buffer,
+                                     out.offset, out.pack_half ? "pkrtz" : "dword", out.src[0],
+                                     out.src[1]));
+            }
+            for (const auto& [ofs, a] : copy_data.attr_map) {
+                XfbTrace(fmt::format("  attr ring {:#x} -> attr {} comp {}", ofs, u32(a.first),
+                                     a.second));
+            }
+        }
         std::map<u32, std::vector<u32>> xfb_users; // ring offset -> captured dwords using it
         std::vector<u32> xfb_pending(copy_data.xfb_outputs.size(), 0);
         std::map<u32, IR::F32> xfb_latest;
@@ -159,9 +177,25 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
             }
         };
 
+        // A stream-out copy shader may export a constant position (e.g. 0 so nothing is
+        // rasterized). Write zero then, instead of leaving the GS position undefined.
+        const bool zero_position =
+            use_xfb && std::ranges::none_of(copy_data.attr_map, [](const auto& entry) {
+                return IR::IsPosition(entry.second.first);
+            });
+
         ForEachInstruction([&](IR::IREmitter& ir, IR::Inst& inst) {
             const auto opcode = inst.GetOpcode();
             switch (opcode) {
+            case IR::Opcode::EmitVertex: {
+                if (zero_position) {
+                    for (u32 comp = 0; comp < 4; comp++) {
+                        ExportPosition(ir, gs_info, false, IR::Attribute::Position0, comp,
+                                       ir.Imm32(0.f));
+                    }
+                }
+                break;
+            }
             case IR::Opcode::LoadBufferU32: {
                 const auto info = inst.Flags<IR::BufferInstInfo>();
                 if (!info.system_coherent || !info.globally_coherent) {

@@ -12,6 +12,8 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "core/memory.h"
+#include "shader_recompiler/frontend/copy_shader.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/recompiler.h"
@@ -523,6 +525,13 @@ bool PipelineCache::RefreshGraphicsKey() {
 }
 
 // Diagnostics for draws that use VGT stream-out (logged once per ES/GS/copy-shader combination).
+#define DIAG_LOG(...)                                                                      \
+    do {                                                                                   \
+        const auto diag_line_ = fmt::format(__VA_ARGS__);                                  \
+        LOG_WARNING(Render_Vulkan, "{}", diag_line_);                                      \
+        Shader::XfbTrace(diag_line_);                                                      \
+    } while (0)
+
 static void LogStreamoutDraw(const AmdGpu::Regs& regs) {
     static std::mutex mutex;
     static std::unordered_set<u64> seen;
@@ -536,6 +545,9 @@ static void LogStreamoutDraw(const AmdGpu::Regs& regs) {
             return;
         }
     }
+    Shader::XfbDumpBinary(fmt::format("strmout_{:08x}_es.bin", es.hash), es.code);
+    Shader::XfbDumpBinary(fmt::format("strmout_{:08x}_gs.bin", gs.hash), gs.code);
+    Shader::XfbDumpBinary(fmt::format("strmout_{:08x}_copy.bin", vc.hash), vc.code);
     const auto& r = regs.reg_array;
     LOG_WARNING(
         Render_Vulkan,
@@ -549,11 +561,11 @@ static void LogStreamoutDraw(const AmdGpu::Regs& regs) {
         r[0xA2E4], r[0xA204], r[0xA205], r[0xA207], r[0xA1B1]);
     for (u32 i = 0; i < 4; i++) {
         const u32 b = 0xA2B4 + i * 4;
-        LOG_WARNING(Render_Vulkan,
+        DIAG_LOG(
                     "STRMOUT-DIAG   buf{}: size_dw={:#x} vtx_stride_dw={} base={:#x} offset={:#x}",
                     i, r[b], r[b + 1], r[b + 2], r[b + 3]);
     }
-    LOG_WARNING(Render_Vulkan,
+    DIAG_LOG(
                 "STRMOUT-DIAG   draw_opaque: offset={:#x} filled_size={:#x} vtx_stride={:#x}",
                 r[0xA2CA], r[0xA2CB], r[0xA2CC]);
     const auto log_pgm = [&](const char* name, const AmdGpu::ShaderProgram& pgm) {
@@ -562,7 +574,7 @@ static void LogStreamoutDraw(const AmdGpu::Regs& regs) {
         for (u32 i = 0; i < 16; i++) {
             ud += fmt::format(" {:08x}", pgm.user_data[i]);
         }
-        LOG_WARNING(Render_Vulkan, "STRMOUT-DIAG   {}: addr={:#x} rsrc1={:#x} rsrc2={:#x} ud:{}",
+        DIAG_LOG( "STRMOUT-DIAG   {}: addr={:#x} rsrc1={:#x} rsrc2={:#x} ud:{}",
                     name, u64(pgm.address) << 8, raw[2], raw[3], ud);
     };
     log_pgm("es", regs.es_program);
@@ -587,21 +599,22 @@ static void LogStreamoutDraw(const AmdGpu::Regs& regs) {
         for (u32 i = 0; i < inst.src_count; i++) {
             ops += fmt::format(" s{}={}:{}", i, u32(inst.src[i].field), inst.src[i].code);
         }
-        LOG_WARNING(Render_Vulkan, "STRMOUT-DIAG   copy[{:4}] op={} enc={}{} |{}", pc,
+        DIAG_LOG( "STRMOUT-DIAG   copy[{:4}] op={} enc={}{} |{}", pc,
                     u32(inst.opcode), u32(inst.encoding), ops, words);
         if (inst.inst_class == Shader::Gcn::InstClass::ScalarMemRd) {
             const u32 sbase = inst.src[0].code * 2;
-            if (sbase + 1 < 16) {
+            const u32 num_user = (reinterpret_cast<const u32*>(&regs.vs_program)[3] >> 1) & 0x1F;
+            if (sbase + 1 < num_user) {
                 const u64 ptr = (u64(regs.vs_program.user_data[sbase]) |
                                  (u64(regs.vs_program.user_data[sbase + 1]) << 32)) &
                                 0xFFFFFFFFFFull;
-                if (ptr > 0x10000 && ptr < 0x10000000000ull) {
+                if (Core::Memory::Instance()->IsValidMapping(ptr, 128)) {
                     const u32* mem = reinterpret_cast<const u32*>(ptr);
                     std::string m;
                     for (u32 i = 0; i < 32; i++) {
                         m += fmt::format(" {:08x}", mem[i]);
                     }
-                    LOG_WARNING(Render_Vulkan, "STRMOUT-DIAG     mem[ud{}={:#x}]:{}", sbase, ptr,
+                    DIAG_LOG( "STRMOUT-DIAG     mem[ud{}={:#x}]:{}", sbase, ptr,
                                 m);
                 }
             }
@@ -755,8 +768,20 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
 
+    const bool trace_xfb = runtime_info.hw_stage == Shader::HwStage::Geometry &&
+                           runtime_info.hw.gs.xfb_buffer_mask != 0;
+    if (trace_xfb) {
+        Shader::XfbTrace(fmt::format("GS translate begin (pgm {:#x})", info.pgm_hash));
+    }
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
+    if (trace_xfb) {
+        Shader::XfbTrace("GS translate end, emit SPIR-V begin");
+    }
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+    if (trace_xfb) {
+        Shader::XfbTrace(fmt::format("GS emit SPIR-V end ({} words)", spv.size()));
+        Shader::XfbDumpBinary(fmt::format("strmout_gs_{:08x}.spv", info.pgm_hash), spv);
+    }
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
 
     vk::ShaderModule module;
