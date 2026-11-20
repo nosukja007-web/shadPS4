@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include "common/path_util.h"
 #include "shader_recompiler/frontend/copy_shader.h"
@@ -10,7 +11,15 @@
 
 namespace Shader {
 
+bool XfbTraceEnabled() {
+    static const bool enabled = std::getenv("SHADPS4_STRMOUT_TRACE") != nullptr;
+    return enabled;
+}
+
 void XfbTrace(std::string_view line) {
+    if (!XfbTraceEnabled()) {
+        return;
+    }
     static std::mutex mutex;
     static std::FILE* file = [] {
         const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "strmout_trace.txt";
@@ -25,6 +34,9 @@ void XfbTrace(std::string_view line) {
 }
 
 void XfbDumpBinary(std::string_view name, std::span<const u32> code) {
+    if (!XfbTraceEnabled()) {
+        return;
+    }
     const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / std::string{name};
     if (std::FILE* f = _wfopen(path.c_str(), L"wb")) {
         std::fwrite(code.data(), sizeof(u32), code.size(), f);

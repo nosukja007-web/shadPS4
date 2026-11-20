@@ -43,6 +43,9 @@ struct CopyShaderData {
 
 CopyShaderData ParseCopyShader(std::span<const u32> code);
 
+/// True when SHADPS4_STRMOUT_TRACE is set (stream-out debug tracing and dumps).
+bool XfbTraceEnabled();
+
 /// Appends a line to log/strmout_trace.txt and flushes it (survives crashes).
 void XfbTrace(std::string_view line);
 /// Writes a binary blob to log/<name> (overwrites).

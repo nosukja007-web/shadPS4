@@ -533,6 +533,9 @@ bool PipelineCache::RefreshGraphicsKey() {
     } while (0)
 
 static void LogStreamoutDraw(const AmdGpu::Regs& regs) {
+    if (!Shader::XfbTraceEnabled()) {
+        return;
+    }
     static std::mutex mutex;
     static std::unordered_set<u64> seen;
     const auto es = AmdGpu::GetParams(regs.es_program);
