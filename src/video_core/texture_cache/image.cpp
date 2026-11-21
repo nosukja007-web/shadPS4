@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <memory>
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -238,6 +239,8 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
         vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
     if (dst_mask & any_write_flags) {
         ++write_tick;
+        static std::atomic<u64> global_write_seq{0};
+        gpu_write_seq = ++global_write_seq;
     }
 
     auto& last_state = backing->state;

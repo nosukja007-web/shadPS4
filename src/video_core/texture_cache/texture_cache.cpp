@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <limits>
+#include <mutex>
+#include <set>
+#include <string>
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -26,6 +30,101 @@ namespace VideoCore {
 static constexpr u32 MAX_IMAGES = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_IMAGE_VIEWS = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_SAMPLERS = std::numeric_limits<u16>::max();
+
+// SHADPS4_DEPTH_NEWEST=0 disables the aliased-depth reconciliation (diagnostics stay on).
+static bool DepthNewestEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_DEPTH_NEWEST");
+        const bool on = !(env && env[0] == '0');
+        LOG_INFO(Render_Vulkan, "Aliased depth reconciliation (SHADPS4_DEPTH_NEWEST) {}",
+                 on ? "enabled" : "disabled");
+        return on;
+    }();
+    return enabled;
+}
+
+/// True when `a` holds GPU data written after anything in `b`. A GPU-valid image is not dirty,
+/// so guest memory has not been rewritten by the CPU since that GPU write.
+static bool IsNewerGpuData(const Image& a, const Image& b) {
+    return a.HasGpuValidData() && a.gpu_write_seq > b.gpu_write_seq;
+}
+
+namespace {
+/// Rate limiter for aliasing diagnostics: each key is logged once, at most kMaxKeys keys.
+class OnceLogger {
+public:
+    bool First(const std::string& key) {
+        std::scoped_lock lk{mutex};
+        if (seen.size() >= kMaxKeys) {
+            return false;
+        }
+        return seen.insert(key).second;
+    }
+
+private:
+    static constexpr size_t kMaxKeys = 256;
+    std::mutex mutex;
+    std::set<std::string> seen;
+};
+OnceLogger alias_log;
+std::atomic<u64> depth_sync_count{0};
+
+std::string DescribeImage(const Image& img) {
+    return fmt::format("{} tile={} {}x{}x{} layers={} mips={} guest_size={:#x} scale={} "
+                       "gpu_modified={} dirty={:#x} gpu_write_seq={}",
+                       vk::to_string(img.info.pixel_format), static_cast<u32>(img.info.tile_mode),
+                       img.info.size.width, img.info.size.height, img.info.size.depth,
+                       img.info.resources.layers, img.info.resources.levels, img.info.guest_size,
+                       img.scale, True(img.flags & ImageFlagBits::GpuModified),
+                       static_cast<u32>(img.flags & ImageFlagBits::Dirty), img.gpu_write_seq);
+}
+} // namespace
+
+static void LogAliasedDepth(const Image& chosen, const Image& other) {
+    const auto key = fmt::format("alias:{:#x}:{}:{}:{}x{}", chosen.info.guest_address,
+                                 vk::to_string(chosen.info.pixel_format),
+                                 vk::to_string(other.info.pixel_format), other.info.size.width,
+                                 other.info.size.height);
+    if (!alias_log.First(key)) {
+        return;
+    }
+    LOG_WARNING(Render_Vulkan,
+                "Depth image {:#x} has an aliased duplicate in the cache:\n  chosen: {}\n"
+                "  other:  {}",
+                chosen.info.guest_address, DescribeImage(chosen), DescribeImage(other));
+}
+
+static void LogDepthSync(const Image& src, const Image& dst, bool copied) {
+    const u64 n = ++depth_sync_count;
+    if (n > 64 && (n % 1000) != 0) {
+        return;
+    }
+    LOG_WARNING(Render_Vulkan,
+                "Aliased depth {:#x}: {} newer GPU data (sync #{})\n  from: {}\n  to:   {}",
+                dst.info.guest_address, copied ? "copying" : "CANNOT copy (layout mismatch)", n,
+                DescribeImage(src), DescribeImage(dst));
+}
+
+static void LogKeptStaleOverlap(const char* reason, const ImageInfo& requested,
+                                const Image& cache_image) {
+    if (!cache_image.HasGpuValidData()) {
+        return;
+    }
+    const auto key = fmt::format("keep:{}:{:#x}:{}:{}", reason, cache_image.info.guest_address,
+                                 vk::to_string(cache_image.info.pixel_format),
+                                 vk::to_string(requested.pixel_format));
+    if (!alias_log.First(key)) {
+        return;
+    }
+    LOG_WARNING(Render_Vulkan,
+                "Overlap ({}) at {:#x}: GPU-modified image kept alongside a new one without "
+                "copying its data\n  kept:      {}\n  requested: {} tile={} {}x{} layers={} "
+                "guest_size={:#x}",
+                reason, cache_image.info.guest_address, DescribeImage(cache_image),
+                vk::to_string(requested.pixel_format), static_cast<u32>(requested.tile_mode),
+                requested.size.width, requested.size.height, requested.resources.layers,
+                requested.guest_size);
+}
 
 static u64 HashBackingMemory(VAddr virtual_addr, u64 size) {
     static constexpr std::array<u8, Core::GUEST_PAGE_SIZE> zeros{};
@@ -386,6 +485,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             // Very likely this kind of overlap is caused by allocation from a pool.
             if (safe_to_delete) {
                 FreeImage(cache_image_id);
+            } else {
+                LogKeptStaleOverlap("block size mismatch", image_info, cache_image);
             }
             return {merged_image_id, -1, -1};
         }
@@ -434,6 +535,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         if (image_info.tile_mode != cache_image.info.tile_mode) {
             if (safe_to_delete) {
                 FreeImage(cache_image_id);
+            } else {
+                LogKeptStaleOverlap("tile mode mismatch", image_info, cache_image);
             }
             return {merged_image_id, -1, -1};
         }
@@ -567,6 +670,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         // Image isn't a subresource but a chance overlap.
         if (safe_to_delete) {
             FreeImage(cache_image_id);
+        } else if (image_info.props.is_depth || cache_image.info.props.is_depth) {
+            LogKeptStaleOverlap("chance overlap", image_info, cache_image);
         }
 
         return {{}, -1, -1};
@@ -678,6 +783,49 @@ ImageId TextureCache::RescaleImage(ImageId image_id, u32 new_scale) {
     return new_image_id;
 }
 
+void TextureCache::ReconcileAliasedDepth(ImageId image_id) {
+    Image& chosen = slot_images[image_id];
+    if (!chosen.info.props.is_depth) {
+        return;
+    }
+    ImageId newest_id{};
+    ForEachImageInRegion(chosen.info.guest_address, chosen.info.guest_size,
+                         [&](ImageId other_id, Image& other) {
+                             if (other_id == image_id ||
+                                 other.info.guest_address != chosen.info.guest_address ||
+                                 !other.info.props.is_depth) {
+                                 return;
+                             }
+                             LogAliasedDepth(chosen, other);
+                             const Image& best = newest_id ? slot_images[newest_id] : chosen;
+                             if (IsNewerGpuData(other, best)) {
+                                 newest_id = other_id;
+                             }
+                         });
+    if (!newest_id || !DepthNewestEnabled()) {
+        return;
+    }
+    Image& src = slot_images[newest_id];
+    // Another image aliasing this depth surface holds newer GPU data (e.g. the surface was
+    // rendered or depth-copied through a D32S8 descriptor and is now sampled as D32). Bring
+    // the depth aspect over so readers do not see a stale snapshot.
+    const bool copyable = src.info.size == chosen.info.size &&
+                          src.info.resources == chosen.info.resources &&
+                          src.info.num_bits == chosen.info.num_bits &&
+                          src.info.num_samples == 1 && chosen.info.num_samples == 1 &&
+                          src.scale == chosen.scale;
+    LogDepthSync(src, chosen, copyable);
+    if (!copyable) {
+        return;
+    }
+    runtime.CopyColorAndDepth(&src, &chosen);
+    chosen.flags |= ImageFlagBits::GpuModified;
+    chosen.flags &= ~ImageFlagBits::Dirty;
+    // Both now hold the same data; equal sequence numbers stop the copy ping-ponging back when
+    // the other alias is looked up next.
+    chosen.gpu_write_seq = src.gpu_write_seq;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto& info = desc.info;
 
@@ -706,6 +854,13 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             continue;
         }
         if (exact_fmt && info.pixel_format != cache_image.info.pixel_format) {
+            continue;
+        }
+        if (image_id && DepthNewestEnabled() &&
+            (cache_image.info.props.is_depth || slot_images[image_id].info.props.is_depth) &&
+            !IsNewerGpuData(cache_image, slot_images[image_id])) {
+            // Several images match exactly; keep the one holding the newest GPU write rather than
+            // whichever happens to come last in the region walk.
             continue;
         }
         image_id = cache_id;
@@ -763,6 +918,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                 image_id = RescaleImage(image_id, scale);
             }
         }
+    }
+
+    if (desc.type != BindingType::Storage) {
+        ReconcileAliasedDepth(image_id);
     }
 
     Image& image = slot_images[image_id];

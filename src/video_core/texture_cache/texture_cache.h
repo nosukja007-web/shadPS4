@@ -170,6 +170,10 @@ public:
                                                                ImageId cache_img_id,
                                                                ImageId merged_image_id);
 
+    /// If another depth image at the same guest address holds newer GPU data than image_id,
+    /// copies its depth aspect into image_id (SHADPS4_DEPTH_NEWEST=0 disables) and logs aliases.
+    void ReconcileAliasedDepth(ImageId image_id);
+
     /// Resolves depth overlap and either re-creates the image or returns existing one
     [[nodiscard]] ImageId ResolveDepthOverlap(const ImageInfo& requested_info, BindingType binding,
                                               ImageId cache_img_id);

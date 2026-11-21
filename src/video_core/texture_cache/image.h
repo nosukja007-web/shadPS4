@@ -168,6 +168,9 @@ public:
     /// Bumped whenever the image is transitioned for a write access (attachment, transfer,
     /// shader or memory write). Used to detect that derived copies may be stale.
     u64 write_tick{};
+    /// Global ordering of GPU writes: set from a process-wide counter whenever write_tick is
+    /// bumped, so writes to different images that alias the same guest memory can be ordered.
+    u64 gpu_write_seq{};
     /// Unregistered R8 color image holding a copy of this depth image's stencil aspect, used
     /// when a shader reads the stencil plane through a float-class (e.g. R8 Unorm) T#.
     ImageId stencil_color_id{};
