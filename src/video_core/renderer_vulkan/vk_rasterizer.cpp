@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/watch_addr.h"
 
 namespace Vulkan {
 
@@ -1198,6 +1199,18 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
              regs.depth_control.depth_write_enable) ||
             texture_cache.IsMetaCleared(htile_address, slice);
         const bool is_stencil_clear = regs.depth_render_control.stencil_clear_enable;
+        if (VideoCore::Watch::Enabled()) {
+            if (const VAddr wb =
+                    VideoCore::Watch::Hit(image.info.guest_address, image.info.guest_size)) {
+                VideoCore::Watch::Log(is_depth_clear ? "depth_target_clear" : "depth_target", wb,
+                                      "uid={} htile={:#x} meta_cleared={} slice={} write={} "
+                                      "view_layers={}",
+                                      image.image_uid, htile_address,
+                                      texture_cache.IsMetaCleared(htile_address, slice), slice,
+                                      bool(regs.depth_control.depth_write_enable),
+                                      image_view.info.range.extent.layers);
+            }
+        }
         texture_cache.TouchMeta(htile_address, slice, false);
         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
 
@@ -1314,6 +1327,22 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
         regs.depth_buffer.StencilAddress(), regs.depth_buffer.DepthWriteAddress(),
         regs.depth_buffer.StencilWriteAddress()));
 
+    if (VideoCore::Watch::Enabled()) {
+        const VAddr r = read_image.info.guest_address;
+        const VAddr w = write_image.info.guest_address;
+        VAddr wb = VideoCore::Watch::Hit(r, read_image.info.guest_size);
+        if (!wb) {
+            wb = VideoCore::Watch::Hit(w, write_image.info.guest_size);
+        }
+        if (wb) {
+            VideoCore::Watch::Log("db_copy", wb,
+                                  "depth={} stencil={} read {:#x} uid={} -> write {:#x} uid={} "
+                                  "layers {}+{}",
+                                  is_depth, is_stencil, r, read_image.image_uid, w,
+                                  write_image.image_uid, sub_range.base.layer,
+                                  sub_range.extent.layers);
+        }
+    }
     runtime.CopyDepthStencil(&read_image, &write_image, sub_range);
 
     ScopeMarkerEnd();
@@ -1323,7 +1352,25 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer address and size must be a multiple of 4 bytes");
     if (!is_gds) {
-        texture_cache.ClearMeta(address);
+        const bool meta_cleared = texture_cache.ClearMeta(address);
+        if (VideoCore::Watch::Enabled()) {
+            if (const VAddr wb = VideoCore::Watch::Hit(address, num_bytes)) {
+                VideoCore::Watch::Log("fill", wb, "[{:#x},+{:#x}) value={:#x}", address,
+                                      num_bytes, value);
+            }
+            if (meta_cleared) {
+                if (const auto meta = texture_cache.GetMetaInfo(address)) {
+                    const auto& owner = texture_cache.GetImage(meta->owner_id);
+                    if (const VAddr wb = VideoCore::Watch::Hit(owner.info.guest_address,
+                                                               owner.info.guest_size)) {
+                        VideoCore::Watch::Log(
+                            "meta_fast_clear", wb,
+                            "fill of meta {:#x} (+{:#x}) value={:#x} owner uid={}", address,
+                            num_bytes, value, owner.image_uid);
+                    }
+                }
+            }
+        }
         if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);
@@ -1341,6 +1388,19 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    if (VideoCore::Watch::Enabled()) {
+        const VAddr wd = dst_gds ? 0 : VideoCore::Watch::Hit(dst, num_bytes);
+        const VAddr ws = src_gds ? 0 : VideoCore::Watch::Hit(src, num_bytes);
+        if (wd || ws) {
+            VideoCore::Watch::Log(
+                wd ? "dma_copy_dst" : "dma_copy_src", wd ? wd : ws,
+                "dst={:#x}{} src={:#x}{} bytes={:#x} dst_gpu_mod={} src_gpu_mod={} src_img={}",
+                dst, dst_gds ? "(gds)" : "", src, src_gds ? "(gds)" : "", num_bytes,
+                !dst_gds && buffer_cache.IsRegionGpuModified(dst, num_bytes),
+                !src_gds && buffer_cache.IsRegionGpuModified(src, num_bytes),
+                !src_gds && bool(texture_cache.FindImageFromRange(src, num_bytes)));
+        }
+    }
     if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {

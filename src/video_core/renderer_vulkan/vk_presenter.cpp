@@ -45,6 +45,7 @@
 #include <imgui.h>
 #include <stb_image_write.h>
 #include <vk_mem_alloc.h>
+#include "video_core/watch_addr.h"
 
 namespace Vulkan {
 
@@ -846,6 +847,9 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    if (is_game_frame) {
+        VideoCore::Watch::NextFrame();
+    }
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
