@@ -27,6 +27,8 @@
 
 namespace Vulkan {
 
+static std::optional<vk::Rect2D> DrawCoverageRect(const AmdGpu::Regs& regs, u32 w, u32 h);
+
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
     // is encountered and implemented in the recompiler.
@@ -223,6 +225,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
+    FlushPendingDepthClear();
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -304,6 +307,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
+    FlushPendingDepthClear();
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
@@ -1249,6 +1253,42 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             attachment.clear_value[0] = is_depth_clear ? std::bit_cast<u32>(regs.depth_clear) : 0u;
             attachment.has_depth = true;
             attachment.depth_clear = is_depth_clear;
+            // A DB clear issued through a draw (DEPTH_CLEAR_ENABLE) only clears the pixels the
+            // draw covers. Nioh clears and redraws one tile of a shadow atlas this way; a
+            // render-pass clear of the whole attachment would wipe the other tiles. Clear only
+            // the covered rectangle inside the pass instead. SHADPS4_DEPTHCLEAR_FULL=1 = old.
+            static const bool full_clear = [] {
+                const char* env = std::getenv("SHADPS4_DEPTHCLEAR_FULL");
+                return env && env[0] == '1';
+            }();
+            if (is_depth_clear && regs.depth_render_control.depth_clear_enable && !full_clear &&
+                !texture_cache.IsMetaCleared(htile_address, slice)) {
+                if (const auto rect =
+                        DrawCoverageRect(regs, image.info.size.width, image.info.size.height)) {
+                    const u32 s = image.scale;
+                    attachment.depth_clear = false;
+                    attachment.clear_value[0] = 0u;
+                    pending_depth_clear = vk::ClearRect{
+                        .rect = {{rect->offset.x * static_cast<s32>(s),
+                                  rect->offset.y * static_cast<s32>(s)},
+                                 {rect->extent.width * s, rect->extent.height * s}},
+                        .baseArrayLayer = 0,
+                        .layerCount = image_view.info.range.extent.layers,
+                    };
+                    pending_depth_clear_value = std::bit_cast<float>(regs.depth_clear);
+                    if (VideoCore::Watch::Enabled()) {
+                        if (const VAddr wb = VideoCore::Watch::Hit(image.info.guest_address,
+                                                                   image.info.guest_size)) {
+                            VideoCore::Watch::Log("depth_clear_rect", wb,
+                                                  "uid={} rect={},{} {}x{} value={}",
+                                                  image.image_uid, rect->offset.x,
+                                                  rect->offset.y, rect->extent.width,
+                                                  rect->extent.height,
+                                                  pending_depth_clear_value);
+                        }
+                    }
+                }
+            }
         }
         if (regs.depth_buffer.StencilValid()) {
             attachment.clear_value[1] = is_stencil_clear ? regs.stencil_clear : 0u;
@@ -1286,6 +1326,18 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     return state;
 }
 
+void Rasterizer::FlushPendingDepthClear() {
+    if (!pending_depth_clear) {
+        return;
+    }
+    const vk::ClearAttachment clear{
+        .aspectMask = vk::ImageAspectFlagBits::eDepth,
+        .clearValue = vk::ClearValue{.depthStencil = {.depth = pending_depth_clear_value}},
+    };
+    scheduler.CommandBuffer().clearAttachments(clear, *pending_depth_clear);
+    pending_depth_clear.reset();
+}
+
 void Rasterizer::Resolve() {
     const auto& mrt0_hint = liverpool->last_cb_extent[0];
     const auto& mrt1_hint = liverpool->last_cb_extent[1];
@@ -1300,6 +1352,46 @@ void Rasterizer::Resolve() {
     runtime.ResolveImage(&mrt0_image, &mrt1_image, mrt0_desc.view_info.range,
                          mrt1_desc.view_info.range);
     ScopeMarkerEnd();
+}
+
+/// Approximates the pixels a draw covers by viewport 0 clipped by the screen/window/generic
+/// (and viewport) scissors, in guest pixels of a w x h surface. Returns nullopt when that covers
+/// the whole surface or nothing sensible can be derived (callers then act on the whole surface).
+static std::optional<vk::Rect2D> DrawCoverageRect(const AmdGpu::Regs& regs, u32 w, u32 h) {
+    s32 x0 = 0, y0 = 0, x1 = static_cast<s32>(w), y1 = static_cast<s32>(h);
+    const auto clip = [&](s32 l, s32 t, s32 r, s32 b) {
+        x0 = std::max(x0, l);
+        y0 = std::max(y0, t);
+        x1 = std::min(x1, r);
+        y1 = std::min(y1, b);
+    };
+    clip(regs.screen_scissor.top_left_x, regs.screen_scissor.top_left_y,
+         regs.screen_scissor.bottom_right_x, regs.screen_scissor.bottom_right_y);
+    clip(s16(regs.window_scissor.top_left_x), s16(regs.window_scissor.top_left_y),
+         regs.window_scissor.bottom_right_x, regs.window_scissor.bottom_right_y);
+    clip(s16(regs.generic_scissor.top_left_x), s16(regs.generic_scissor.top_left_y),
+         regs.generic_scissor.bottom_right_x, regs.generic_scissor.bottom_right_y);
+    if (regs.mode_control.vport_scissor_enable) {
+        clip(s16(regs.viewport_scissors[0].top_left_x), s16(regs.viewport_scissors[0].top_left_y),
+             regs.viewport_scissors[0].bottom_right_x, regs.viewport_scissors[0].bottom_right_y);
+    }
+    const auto& vp = regs.viewports[0];
+    if (vp.xscale != 0.f && !regs.IsClipDisabled()) {
+        const auto& vp_ctl = regs.viewport_control;
+        const float xo = vp_ctl.xoffset_enable ? vp.xoffset : 0.f;
+        const float xs = std::abs(vp_ctl.xscale_enable ? vp.xscale : 1.f);
+        const float yo = vp_ctl.yoffset_enable ? vp.yoffset : 0.f;
+        const float ys = std::abs(vp_ctl.yscale_enable ? vp.yscale : 1.f);
+        clip(static_cast<s32>(std::floor(xo - xs)), static_cast<s32>(std::floor(yo - ys)),
+             static_cast<s32>(std::ceil(xo + xs)), static_cast<s32>(std::ceil(yo + ys)));
+    }
+    if (x1 <= x0 || y1 <= y0) {
+        return std::nullopt;
+    }
+    if (x0 == 0 && y0 == 0 && x1 >= static_cast<s32>(w) && y1 >= static_cast<s32>(h)) {
+        return std::nullopt;
+    }
+    return vk::Rect2D{{x0, y0}, {static_cast<u32>(x1 - x0), static_cast<u32>(y1 - y0)}};
 }
 
 void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
@@ -1339,49 +1431,10 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
         if (full_copy) {
             return std::nullopt;
         }
-        const s32 img_w = static_cast<s32>(std::min(read_image.info.size.width,
-                                                    write_image.info.size.width));
-        const s32 img_h = static_cast<s32>(std::min(read_image.info.size.height,
-                                                     write_image.info.size.height));
-        s32 x0 = 0, y0 = 0, x1 = img_w, y1 = img_h;
-        const auto clip = [&](s32 l, s32 t, s32 r, s32 b) {
-            x0 = std::max(x0, l);
-            y0 = std::max(y0, t);
-            x1 = std::min(x1, r);
-            y1 = std::min(y1, b);
-        };
-        // Screen/window/generic scissors (window offset ignored, as for copies it is 0).
-        clip(regs.screen_scissor.top_left_x, regs.screen_scissor.top_left_y,
-             regs.screen_scissor.bottom_right_x, regs.screen_scissor.bottom_right_y);
-        clip(s16(regs.window_scissor.top_left_x), s16(regs.window_scissor.top_left_y),
-             regs.window_scissor.bottom_right_x, regs.window_scissor.bottom_right_y);
-        clip(s16(regs.generic_scissor.top_left_x), s16(regs.generic_scissor.top_left_y),
-             regs.generic_scissor.bottom_right_x, regs.generic_scissor.bottom_right_y);
-        const auto& vp = regs.viewports[0];
-        if (regs.mode_control.vport_scissor_enable) {
-            clip(s16(regs.viewport_scissors[0].top_left_x),
-                 s16(regs.viewport_scissors[0].top_left_y),
-                 regs.viewport_scissors[0].bottom_right_x,
-                 regs.viewport_scissors[0].bottom_right_y);
-        }
-        if (vp.xscale != 0.f && !regs.IsClipDisabled()) {
-            const auto& vp_ctl = regs.viewport_control;
-            const float xo = vp_ctl.xoffset_enable ? vp.xoffset : 0.f;
-            const float xs = std::abs(vp_ctl.xscale_enable ? vp.xscale : 1.f);
-            const float yo = vp_ctl.yoffset_enable ? vp.yoffset : 0.f;
-            const float ys = std::abs(vp_ctl.yscale_enable ? vp.yscale : 1.f);
-            clip(static_cast<s32>(std::floor(xo - xs)), static_cast<s32>(std::floor(yo - ys)),
-                 static_cast<s32>(std::ceil(xo + xs)), static_cast<s32>(std::ceil(yo + ys)));
-        }
-        if (x1 <= x0 || y1 <= y0) {
-            // Nothing sensible; keep the previous whole-image behaviour.
-            return std::nullopt;
-        }
-        if (x0 == 0 && y0 == 0 && x1 >= static_cast<s32>(write_image.info.size.width) &&
-            y1 >= static_cast<s32>(write_image.info.size.height)) {
-            return std::nullopt;
-        }
-        return vk::Rect2D{{x0, y0}, {static_cast<u32>(x1 - x0), static_cast<u32>(y1 - y0)}};
+        return DrawCoverageRect(regs,
+                                std::min(read_image.info.size.width, write_image.info.size.width),
+                                std::min(read_image.info.size.height,
+                                         write_image.info.size.height));
     }();
     if (VideoCore::Watch::Enabled()) {
         const VAddr r = read_image.info.guest_address;

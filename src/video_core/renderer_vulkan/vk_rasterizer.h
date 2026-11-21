@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <optional>
 #include <unordered_map>
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
@@ -200,6 +201,11 @@ private:
     bool attachment_feedback_loop{};
     bool needs_barrier{};
     u32 render_scale{1}; ///< Host resolution multiplier of the current render pass attachments.
+    /// Depth clear limited to the clearing draw's area, recorded once the pass has begun.
+    std::optional<vk::ClearRect> pending_depth_clear{};
+    float pending_depth_clear_value{};
+
+    void FlushPendingDepthClear();
 };
 
 } // namespace Vulkan
