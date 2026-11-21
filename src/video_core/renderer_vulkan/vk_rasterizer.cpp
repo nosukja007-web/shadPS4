@@ -1327,6 +1327,62 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
         regs.depth_buffer.StencilAddress(), regs.depth_buffer.DepthWriteAddress(),
         regs.depth_buffer.StencilWriteAddress()));
 
+    // The DB copy only touches the pixels covered by the copy draw. Games refresh one tile of a
+    // shadow atlas this way (e.g. Nioh's static shadow cache), so copying the whole surface would
+    // overwrite the other tiles with whatever the source holds there. Approximate the coverage
+    // with viewport 0 clipped by the scissors. SHADPS4_DBCOPY_FULL=1 restores whole-image copies.
+    const auto copy_rect = [&]() -> std::optional<vk::Rect2D> {
+        static const bool full_copy = [] {
+            const char* env = std::getenv("SHADPS4_DBCOPY_FULL");
+            return env && env[0] == '1';
+        }();
+        if (full_copy) {
+            return std::nullopt;
+        }
+        const s32 img_w = static_cast<s32>(std::min(read_image.info.size.width,
+                                                    write_image.info.size.width));
+        const s32 img_h = static_cast<s32>(std::min(read_image.info.size.height,
+                                                     write_image.info.size.height));
+        s32 x0 = 0, y0 = 0, x1 = img_w, y1 = img_h;
+        const auto clip = [&](s32 l, s32 t, s32 r, s32 b) {
+            x0 = std::max(x0, l);
+            y0 = std::max(y0, t);
+            x1 = std::min(x1, r);
+            y1 = std::min(y1, b);
+        };
+        // Screen/window/generic scissors (window offset ignored, as for copies it is 0).
+        clip(regs.screen_scissor.top_left_x, regs.screen_scissor.top_left_y,
+             regs.screen_scissor.bottom_right_x, regs.screen_scissor.bottom_right_y);
+        clip(s16(regs.window_scissor.top_left_x), s16(regs.window_scissor.top_left_y),
+             regs.window_scissor.bottom_right_x, regs.window_scissor.bottom_right_y);
+        clip(s16(regs.generic_scissor.top_left_x), s16(regs.generic_scissor.top_left_y),
+             regs.generic_scissor.bottom_right_x, regs.generic_scissor.bottom_right_y);
+        const auto& vp = regs.viewports[0];
+        if (regs.mode_control.vport_scissor_enable) {
+            clip(s16(regs.viewport_scissors[0].top_left_x),
+                 s16(regs.viewport_scissors[0].top_left_y),
+                 regs.viewport_scissors[0].bottom_right_x,
+                 regs.viewport_scissors[0].bottom_right_y);
+        }
+        if (vp.xscale != 0.f && !regs.IsClipDisabled()) {
+            const auto& vp_ctl = regs.viewport_control;
+            const float xo = vp_ctl.xoffset_enable ? vp.xoffset : 0.f;
+            const float xs = std::abs(vp_ctl.xscale_enable ? vp.xscale : 1.f);
+            const float yo = vp_ctl.yoffset_enable ? vp.yoffset : 0.f;
+            const float ys = std::abs(vp_ctl.yscale_enable ? vp.yscale : 1.f);
+            clip(static_cast<s32>(std::floor(xo - xs)), static_cast<s32>(std::floor(yo - ys)),
+                 static_cast<s32>(std::ceil(xo + xs)), static_cast<s32>(std::ceil(yo + ys)));
+        }
+        if (x1 <= x0 || y1 <= y0) {
+            // Nothing sensible; keep the previous whole-image behaviour.
+            return std::nullopt;
+        }
+        if (x0 == 0 && y0 == 0 && x1 >= static_cast<s32>(write_image.info.size.width) &&
+            y1 >= static_cast<s32>(write_image.info.size.height)) {
+            return std::nullopt;
+        }
+        return vk::Rect2D{{x0, y0}, {static_cast<u32>(x1 - x0), static_cast<u32>(y1 - y0)}};
+    }();
     if (VideoCore::Watch::Enabled()) {
         const VAddr r = read_image.info.guest_address;
         const VAddr w = write_image.info.guest_address;
@@ -1337,13 +1393,18 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
         if (wb) {
             VideoCore::Watch::Log("db_copy", wb,
                                   "depth={} stencil={} read {:#x} uid={} -> write {:#x} uid={} "
-                                  "layers {}+{}",
+                                  "layers {}+{} rect={}",
                                   is_depth, is_stencil, r, read_image.image_uid, w,
                                   write_image.image_uid, sub_range.base.layer,
-                                  sub_range.extent.layers);
+                                  sub_range.extent.layers,
+                                  copy_rect ? fmt::format("{},{} {}x{}", copy_rect->offset.x,
+                                                          copy_rect->offset.y,
+                                                          copy_rect->extent.width,
+                                                          copy_rect->extent.height)
+                                            : std::string{"full"});
         }
     }
-    runtime.CopyDepthStencil(&read_image, &write_image, sub_range);
+    runtime.CopyDepthStencil(&read_image, &write_image, sub_range, copy_rect);
 
     ScopeMarkerEnd();
 }

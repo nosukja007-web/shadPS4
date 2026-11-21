@@ -743,7 +743,8 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
 }
 
 void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
-                               const VideoCore::SubresourceRange& sub_range) {
+                               const VideoCore::SubresourceRange& sub_range,
+                               std::optional<vk::Rect2D> copy_rect) {
     if (ScaleMismatch(src, dst, "CopyDepthStencil")) {
         return;
     }
@@ -760,7 +761,7 @@ void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
 
     const auto aspect_mask = src->aspect_mask & dst->aspect_mask;
 
-    const vk::ImageCopy region = {
+    vk::ImageCopy region = {
         .srcSubresource{
             .aspectMask = aspect_mask,
             .mipLevel = 0,
@@ -777,6 +778,14 @@ void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
         .dstOffset = {0, 0, 0},
         .extent = {dst->HostWidth(), dst->HostHeight(), 1},
     };
+    if (copy_rect) {
+        // The rectangle is in guest pixels and both images share the same scale.
+        const s32 scale = static_cast<s32>(dst->scale);
+        region.srcOffset = vk::Offset3D{copy_rect->offset.x * scale, copy_rect->offset.y * scale, 0};
+        region.dstOffset = region.srcOffset;
+        region.extent = vk::Extent3D{copy_rect->extent.width * scale,
+                                     copy_rect->extent.height * scale, 1};
+    }
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
