@@ -1419,23 +1419,6 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
         regs.depth_buffer.StencilAddress(), regs.depth_buffer.DepthWriteAddress(),
         regs.depth_buffer.StencilWriteAddress()));
 
-    // The DB copy only touches the pixels covered by the copy draw. Games refresh one tile of a
-    // shadow atlas this way (e.g. Nioh's static shadow cache), so copying the whole surface would
-    // overwrite the other tiles with whatever the source holds there. Approximate the coverage
-    // with viewport 0 clipped by the scissors. SHADPS4_DBCOPY_FULL=1 restores whole-image copies.
-    const auto copy_rect = [&]() -> std::optional<vk::Rect2D> {
-        static const bool full_copy = [] {
-            const char* env = std::getenv("SHADPS4_DBCOPY_FULL");
-            return env && env[0] == '1';
-        }();
-        if (full_copy) {
-            return std::nullopt;
-        }
-        return DrawCoverageRect(regs,
-                                std::min(read_image.info.size.width, write_image.info.size.width),
-                                std::min(read_image.info.size.height,
-                                         write_image.info.size.height));
-    }();
     if (VideoCore::Watch::Enabled()) {
         const VAddr r = read_image.info.guest_address;
         const VAddr w = write_image.info.guest_address;
@@ -1446,18 +1429,13 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
         if (wb) {
             VideoCore::Watch::Log("db_copy", wb,
                                   "depth={} stencil={} read {:#x} uid={} -> write {:#x} uid={} "
-                                  "layers {}+{} rect={}",
+                                  "layers {}+{}",
                                   is_depth, is_stencil, r, read_image.image_uid, w,
                                   write_image.image_uid, sub_range.base.layer,
-                                  sub_range.extent.layers,
-                                  copy_rect ? fmt::format("{},{} {}x{}", copy_rect->offset.x,
-                                                          copy_rect->offset.y,
-                                                          copy_rect->extent.width,
-                                                          copy_rect->extent.height)
-                                            : std::string{"full"});
+                                  sub_range.extent.layers);
         }
     }
-    runtime.CopyDepthStencil(&read_image, &write_image, sub_range, copy_rect);
+    runtime.CopyDepthStencil(&read_image, &write_image, sub_range);
 
     ScopeMarkerEnd();
 }

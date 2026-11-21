@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <optional>
 #include "common/interval_set.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -58,11 +57,8 @@ public:
 
     void CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst);
 
-    /// Copies depth and/or stencil between images. When `copy_rect` is set (guest pixels), only
-    /// that rectangle is copied, as the DB does for the pixels covered by the copy draw.
     void CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
-                          const VideoCore::SubresourceRange& sub_range,
-                          std::optional<vk::Rect2D> copy_rect = std::nullopt);
+                          const VideoCore::SubresourceRange& sub_range);
 
     /// Copies the stencil aspect of a single-sampled depth-stencil image into an R8 color image
     /// of the same host extent, layers and mips through an intermediate buffer.
