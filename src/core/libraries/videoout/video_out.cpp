@@ -401,7 +401,11 @@ s32 PS4_SYSV_ABI sceVideoOutAdjustColor(s32 handle, const SceVideoOutColorSettin
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
 
-    presenter->GetPPSettingsRef().gamma = settings->gamma;
+    auto& pp_gamma = presenter->GetPPSettingsRef().gamma;
+    if (pp_gamma != settings->gamma) {
+        LOG_INFO(Lib_VideoOut, "Display gamma (game brightness) set to {}", settings->gamma);
+    }
+    pp_gamma = settings->gamma;
     return ORBIS_OK;
 }
 
