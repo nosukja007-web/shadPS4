@@ -23,8 +23,11 @@
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/watch_addr.h"
 
 namespace Vulkan {
+
+static std::optional<vk::Rect2D> DrawCoverageRect(const AmdGpu::Regs& regs, u32 w, u32 h);
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -222,6 +225,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
+    FlushPendingDepthClear();
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -303,6 +307,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
+    FlushPendingDepthClear();
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
@@ -1198,6 +1203,18 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
              regs.depth_control.depth_write_enable) ||
             texture_cache.IsMetaCleared(htile_address, slice);
         const bool is_stencil_clear = regs.depth_render_control.stencil_clear_enable;
+        if (VideoCore::Watch::Enabled()) {
+            if (const VAddr wb =
+                    VideoCore::Watch::Hit(image.info.guest_address, image.info.guest_size)) {
+                VideoCore::Watch::Log(is_depth_clear ? "depth_target_clear" : "depth_target", wb,
+                                      "uid={} htile={:#x} meta_cleared={} slice={} write={} "
+                                      "view_layers={}",
+                                      image.image_uid, htile_address,
+                                      texture_cache.IsMetaCleared(htile_address, slice), slice,
+                                      bool(regs.depth_control.depth_write_enable),
+                                      image_view.info.range.extent.layers);
+            }
+        }
         texture_cache.TouchMeta(htile_address, slice, false);
         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
 
@@ -1236,6 +1253,42 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             attachment.clear_value[0] = is_depth_clear ? std::bit_cast<u32>(regs.depth_clear) : 0u;
             attachment.has_depth = true;
             attachment.depth_clear = is_depth_clear;
+            // A DB clear issued through a draw (DEPTH_CLEAR_ENABLE) only clears the pixels the
+            // draw covers. Nioh clears and redraws one tile of a shadow atlas this way; a
+            // render-pass clear of the whole attachment would wipe the other tiles. Clear only
+            // the covered rectangle inside the pass instead. SHADPS4_DEPTHCLEAR_FULL=1 = old.
+            static const bool full_clear = [] {
+                const char* env = std::getenv("SHADPS4_DEPTHCLEAR_FULL");
+                return env && env[0] == '1';
+            }();
+            if (is_depth_clear && regs.depth_render_control.depth_clear_enable && !full_clear &&
+                !texture_cache.IsMetaCleared(htile_address, slice)) {
+                if (const auto rect =
+                        DrawCoverageRect(regs, image.info.size.width, image.info.size.height)) {
+                    const u32 s = image.scale;
+                    attachment.depth_clear = false;
+                    attachment.clear_value[0] = 0u;
+                    pending_depth_clear = vk::ClearRect{
+                        .rect = {{rect->offset.x * static_cast<s32>(s),
+                                  rect->offset.y * static_cast<s32>(s)},
+                                 {rect->extent.width * s, rect->extent.height * s}},
+                        .baseArrayLayer = 0,
+                        .layerCount = image_view.info.range.extent.layers,
+                    };
+                    pending_depth_clear_value = std::bit_cast<float>(regs.depth_clear);
+                    if (VideoCore::Watch::Enabled()) {
+                        if (const VAddr wb = VideoCore::Watch::Hit(image.info.guest_address,
+                                                                   image.info.guest_size)) {
+                            VideoCore::Watch::Log("depth_clear_rect", wb,
+                                                  "uid={} rect={},{} {}x{} value={}",
+                                                  image.image_uid, rect->offset.x,
+                                                  rect->offset.y, rect->extent.width,
+                                                  rect->extent.height,
+                                                  pending_depth_clear_value);
+                        }
+                    }
+                }
+            }
         }
         if (regs.depth_buffer.StencilValid()) {
             attachment.clear_value[1] = is_stencil_clear ? regs.stencil_clear : 0u;
@@ -1273,6 +1326,18 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     return state;
 }
 
+void Rasterizer::FlushPendingDepthClear() {
+    if (!pending_depth_clear) {
+        return;
+    }
+    const vk::ClearAttachment clear{
+        .aspectMask = vk::ImageAspectFlagBits::eDepth,
+        .clearValue = vk::ClearValue{.depthStencil = {.depth = pending_depth_clear_value}},
+    };
+    scheduler.CommandBuffer().clearAttachments(clear, *pending_depth_clear);
+    pending_depth_clear.reset();
+}
+
 void Rasterizer::Resolve() {
     const auto& mrt0_hint = liverpool->last_cb_extent[0];
     const auto& mrt1_hint = liverpool->last_cb_extent[1];
@@ -1287,6 +1352,46 @@ void Rasterizer::Resolve() {
     runtime.ResolveImage(&mrt0_image, &mrt1_image, mrt0_desc.view_info.range,
                          mrt1_desc.view_info.range);
     ScopeMarkerEnd();
+}
+
+/// Approximates the pixels a draw covers by viewport 0 clipped by the screen/window/generic
+/// (and viewport) scissors, in guest pixels of a w x h surface. Returns nullopt when that covers
+/// the whole surface or nothing sensible can be derived (callers then act on the whole surface).
+static std::optional<vk::Rect2D> DrawCoverageRect(const AmdGpu::Regs& regs, u32 w, u32 h) {
+    s32 x0 = 0, y0 = 0, x1 = static_cast<s32>(w), y1 = static_cast<s32>(h);
+    const auto clip = [&](s32 l, s32 t, s32 r, s32 b) {
+        x0 = std::max(x0, l);
+        y0 = std::max(y0, t);
+        x1 = std::min(x1, r);
+        y1 = std::min(y1, b);
+    };
+    clip(regs.screen_scissor.top_left_x, regs.screen_scissor.top_left_y,
+         regs.screen_scissor.bottom_right_x, regs.screen_scissor.bottom_right_y);
+    clip(s16(regs.window_scissor.top_left_x), s16(regs.window_scissor.top_left_y),
+         regs.window_scissor.bottom_right_x, regs.window_scissor.bottom_right_y);
+    clip(s16(regs.generic_scissor.top_left_x), s16(regs.generic_scissor.top_left_y),
+         regs.generic_scissor.bottom_right_x, regs.generic_scissor.bottom_right_y);
+    if (regs.mode_control.vport_scissor_enable) {
+        clip(s16(regs.viewport_scissors[0].top_left_x), s16(regs.viewport_scissors[0].top_left_y),
+             regs.viewport_scissors[0].bottom_right_x, regs.viewport_scissors[0].bottom_right_y);
+    }
+    const auto& vp = regs.viewports[0];
+    if (vp.xscale != 0.f && !regs.IsClipDisabled()) {
+        const auto& vp_ctl = regs.viewport_control;
+        const float xo = vp_ctl.xoffset_enable ? vp.xoffset : 0.f;
+        const float xs = std::abs(vp_ctl.xscale_enable ? vp.xscale : 1.f);
+        const float yo = vp_ctl.yoffset_enable ? vp.yoffset : 0.f;
+        const float ys = std::abs(vp_ctl.yscale_enable ? vp.yscale : 1.f);
+        clip(static_cast<s32>(std::floor(xo - xs)), static_cast<s32>(std::floor(yo - ys)),
+             static_cast<s32>(std::ceil(xo + xs)), static_cast<s32>(std::ceil(yo + ys)));
+    }
+    if (x1 <= x0 || y1 <= y0) {
+        return std::nullopt;
+    }
+    if (x0 == 0 && y0 == 0 && x1 >= static_cast<s32>(w) && y1 >= static_cast<s32>(h)) {
+        return std::nullopt;
+    }
+    return vk::Rect2D{{x0, y0}, {static_cast<u32>(x1 - x0), static_cast<u32>(y1 - y0)}};
 }
 
 void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
@@ -1314,6 +1419,22 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
         regs.depth_buffer.StencilAddress(), regs.depth_buffer.DepthWriteAddress(),
         regs.depth_buffer.StencilWriteAddress()));
 
+    if (VideoCore::Watch::Enabled()) {
+        const VAddr r = read_image.info.guest_address;
+        const VAddr w = write_image.info.guest_address;
+        VAddr wb = VideoCore::Watch::Hit(r, read_image.info.guest_size);
+        if (!wb) {
+            wb = VideoCore::Watch::Hit(w, write_image.info.guest_size);
+        }
+        if (wb) {
+            VideoCore::Watch::Log("db_copy", wb,
+                                  "depth={} stencil={} read {:#x} uid={} -> write {:#x} uid={} "
+                                  "layers {}+{}",
+                                  is_depth, is_stencil, r, read_image.image_uid, w,
+                                  write_image.image_uid, sub_range.base.layer,
+                                  sub_range.extent.layers);
+        }
+    }
     runtime.CopyDepthStencil(&read_image, &write_image, sub_range);
 
     ScopeMarkerEnd();
@@ -1323,7 +1444,25 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer address and size must be a multiple of 4 bytes");
     if (!is_gds) {
-        texture_cache.ClearMeta(address);
+        const bool meta_cleared = texture_cache.ClearMeta(address);
+        if (VideoCore::Watch::Enabled()) {
+            if (const VAddr wb = VideoCore::Watch::Hit(address, num_bytes)) {
+                VideoCore::Watch::Log("fill", wb, "[{:#x},+{:#x}) value={:#x}", address,
+                                      num_bytes, value);
+            }
+            if (meta_cleared) {
+                if (const auto meta = texture_cache.GetMetaInfo(address)) {
+                    const auto& owner = texture_cache.GetImage(meta->owner_id);
+                    if (const VAddr wb = VideoCore::Watch::Hit(owner.info.guest_address,
+                                                               owner.info.guest_size)) {
+                        VideoCore::Watch::Log(
+                            "meta_fast_clear", wb,
+                            "fill of meta {:#x} (+{:#x}) value={:#x} owner uid={}", address,
+                            num_bytes, value, owner.image_uid);
+                    }
+                }
+            }
+        }
         if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);
@@ -1341,6 +1480,19 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    if (VideoCore::Watch::Enabled()) {
+        const VAddr wd = dst_gds ? 0 : VideoCore::Watch::Hit(dst, num_bytes);
+        const VAddr ws = src_gds ? 0 : VideoCore::Watch::Hit(src, num_bytes);
+        if (wd || ws) {
+            VideoCore::Watch::Log(
+                wd ? "dma_copy_dst" : "dma_copy_src", wd ? wd : ws,
+                "dst={:#x}{} src={:#x}{} bytes={:#x} dst_gpu_mod={} src_gpu_mod={} src_img={}",
+                dst, dst_gds ? "(gds)" : "", src, src_gds ? "(gds)" : "", num_bytes,
+                !dst_gds && buffer_cache.IsRegionGpuModified(dst, num_bytes),
+                !src_gds && buffer_cache.IsRegionGpuModified(src, num_bytes),
+                !src_gds && bool(texture_cache.FindImageFromRange(src, num_bytes)));
+        }
+    }
     if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {

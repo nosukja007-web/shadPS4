@@ -20,12 +20,30 @@
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
+#include "video_core/watch_addr.h"
 
 namespace VideoCore {
 
 static constexpr u32 MAX_IMAGES = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_IMAGE_VIEWS = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_SAMPLERS = std::numeric_limits<u16>::max();
+
+static std::string WatchDesc(const Image& img) {
+    return fmt::format("uid={} {} {}x{} layers={} tile={} size={:#x} scale={} flags={:#x} "
+                       "gpu_valid={} htile={:#x}",
+                       img.image_uid, vk::to_string(img.info.pixel_format), img.info.size.width,
+                       img.info.size.height, img.info.resources.layers,
+                       static_cast<u32>(img.info.tile_mode), img.info.guest_size, img.scale,
+                       static_cast<u32>(img.flags), img.HasGpuValidData(),
+                       img.info.meta_info.htile_addr);
+}
+
+static VAddr WatchImage(const Image& img) {
+    if (!Watch::Enabled()) {
+        return 0;
+    }
+    return Watch::Hit(img.info.guest_address, img.info.guest_size);
+}
 
 static u64 HashBackingMemory(VAddr virtual_addr, u64 size) {
     static constexpr std::array<u8, Core::GUEST_PAGE_SIZE> zeros{};
@@ -150,6 +168,10 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
     }
+    if (const VAddr wb = WatchImage(image)) {
+        Watch::Log("download_to_ram", wb, "{} dl_flags={:#x}", WatchDesc(image),
+                   static_cast<u32>(flags));
+    }
     const auto image_addr = image.info.guest_address;
     const auto image_size = image.info.guest_size;
     const auto image_mips = image.info.resources.levels;
@@ -238,6 +260,10 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
 
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
+        if (const VAddr wb = WatchImage(image)) {
+            Watch::Log("cpu_write_invalidate", wb, "write [{:#x},+{:#x}) overlaps={} {}", addr,
+                       size, image.Overlaps(addr, size), WatchDesc(image));
+        }
         if (image.Overlaps(addr, size)) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
@@ -271,6 +297,10 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         }
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
+        if (const VAddr wb = WatchImage(image)) {
+            Watch::Log("gpu_dirty_from_dma", wb, "dst [{:#x},+{:#x}) {}", address, max_size,
+                       WatchDesc(image));
+        }
     });
 }
 
@@ -768,6 +798,15 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     Image& image = slot_images[image_id];
     image.tick_accessed_last = scheduler.CurrentTick();
     TouchImage(image);
+    if (const VAddr wb = WatchImage(image)) {
+        static constexpr std::array<const char*, 5> type_names{"find_texture", "find_storage",
+                                                               "find_rt", "find_depth_target",
+                                                               "find_other"};
+        const auto t = std::min<size_t>(static_cast<size_t>(desc.type), type_names.size() - 1);
+        Watch::Log(type_names[t], wb, "req {} {}x{} tile={} -> {}",
+                   vk::to_string(info.pixel_format), info.size.width, info.size.height,
+                   static_cast<u32>(info.tile_mode), WatchDesc(image));
+    }
 
     // If the image requested is a subresource of the image from cache record its location.
     if (view_mip > 0) {
@@ -1019,6 +1058,10 @@ void TextureCache::RefreshImage(Image& image) {
         image.cpu_hash = hash;
     }
 
+    if (const VAddr wb = WatchImage(image)) {
+        Watch::Log("upload_from_memory", wb,
+                   "(re)upload, contents replaced by guest/buffer data {}", WatchDesc(image));
+    }
     image.gpu_hash = 0;
 
     const u32 num_layers = image.info.resources.layers;
@@ -1088,6 +1131,9 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    if (const VAddr wb = WatchImage(image)) {
+        Watch::Log("create", wb, "{}", WatchDesc(image));
+    }
     image.memory_usage_counter = &total_used_memory;
     total_used_memory += Common::AlignUp(image.SizeBytes(), 1024);
     image_lru_cache.Insert(image, gc_tick);
@@ -1107,6 +1153,9 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
+    if (const VAddr wb = WatchImage(image)) {
+        Watch::Log("unregister", wb, "{}", WatchDesc(image));
+    }
     image.memory_usage_counter = nullptr;
     image_lru_cache.Free(image);
     total_used_memory -= Common::AlignUp(image.SizeBytes(), 1024);
@@ -1254,6 +1303,10 @@ void TextureCache::GarbageCollectImages() {
         if (download && (!pressured || !image.CanBeDownloaded())) {
             return false;
         }
+        if (const VAddr wb = WatchImage(image)) {
+            Watch::Log("gc_evict", wb, "download={} pressured={} {}", download, pressured,
+                       WatchDesc(image));
+        }
         --num_deletions;
         const auto image_id = slot_images.GetSlotId(image);
         if (download) {
@@ -1387,6 +1440,9 @@ void TextureCache::DeleteImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(image.IsUntracked(), "Image was not untracked");
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");
+    if (const VAddr wb = WatchImage(image)) {
+        Watch::Log("delete", wb, "{}", WatchDesc(image));
+    }
 
     // Remove any registered meta areas.
     const auto& meta_info = image.info.meta_info;
