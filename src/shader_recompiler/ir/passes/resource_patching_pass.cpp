@@ -168,8 +168,12 @@ SharpLocation SharpLocationFromSource(const IR::Inst* inst) {
         return static_cast<SharpLocation>(inst->Arg(0).ScalarReg());
     } else if (inst->GetOpcode() == IR::Opcode::ReadConstBuffer) {
         location = inst->Flags<IR::BufferInstInfo>().flatbuf_off_dw;
-    } else {
+    } else if (inst->GetOpcode() == IR::Opcode::ReadConst) {
         location = inst->Flags<SharpLocation>();
+    } else {
+        // Not a sharp source the flattening pass knows about (already warned during
+        // resource discovery). Its flags mean something else, so don't read them.
+        return UNKNOWN_LOCATION;
     }
     if (location == 0) {
         LOG_WARNING(Render_Recompiler, "Sharp source was not flatenned");

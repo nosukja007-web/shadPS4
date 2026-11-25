@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
 #include "shader_recompiler/ir/passes/resource_pass.h"
 #include "shader_recompiler/ir/program.h"
@@ -273,6 +274,34 @@ SamplerPatchResult CheckClearAnisoRatioAndThresholdPattern(IR::Value value) {
     return {inst->Arg(0), true};
 }
 
+static IR::Value UnwrapReadFirstLane(IR::Value value) {
+    // A sharp dword computed in VGPRs and broadcast with v_readfirstlane_b32 is still a
+    // uniform sharp dword; look through the broadcast to the real producer.
+    while (auto* inst = value.TryInst()) {
+        if (inst->GetOpcode() != IR::Opcode::ReadFirstLane) {
+            break;
+        }
+        value = inst->Arg(0);
+    }
+    return value;
+}
+
+static void WarnUnknownSharpSource(const IR::Inst* source, size_t dword) {
+    std::string args;
+    for (size_t i = 0; i < source->NumArgs(); ++i) {
+        const IR::Value arg = source->Arg(i);
+        if (arg.IsImmediate()) {
+            args += " imm";
+        } else {
+            args += fmt::format(" {}", arg.Inst()->GetOpcode());
+        }
+    }
+    LOG_WARNING(Render_Recompiler,
+                "Sharp dword {} comes from unsupported source {} (args:{}); resource will be "
+                "bound as null",
+                dword, source->GetOpcode(), args);
+}
+
 IR::Inst* FindSharpSource(IR::Inst* handle) {
     ASSERT(IsSharpSource(handle));
     return handle;
@@ -286,7 +315,12 @@ void MarkReadConstBufferSharpSources(const SharpReference& sharp) {
         if (!source) {
             continue;
         }
-        ASSERT(IsSharpSource(source));
+        if (!IsSharpSource(source)) {
+            // Unknown producer: don't abort the whole emulator. ConstructSharpFetch marks
+            // the fetch as invalid and the resource gets a null binding instead.
+            WarnUnknownSharpSource(source, i);
+            continue;
+        }
         if (source->GetOpcode() == IR::Opcode::ReadConstBuffer) {
             auto flags = source->Flags<IR::BufferInstInfo>();
             flags.sharp_source.Assign(1u);
@@ -340,11 +374,11 @@ void DiscoverImageSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList&
     // Gather T# dwords
     IR::Inst* tsharp_low = image_handle->Arg(0).Inst();
     for (size_t i = 0; i < tsharp_low->NumArgs(); ++i) {
-        tsharp.dwords[tsharp.num_dwords++] = tsharp_low->Arg(i);
+        tsharp.dwords[tsharp.num_dwords++] = UnwrapReadFirstLane(tsharp_low->Arg(i));
     }
     if (auto tsharp_high = image_handle->Arg(1).TryInst()) {
         for (size_t i = 0; i < tsharp_high->NumArgs(); ++i) {
-            tsharp.dwords[tsharp.num_dwords++] = tsharp_high->Arg(i);
+            tsharp.dwords[tsharp.num_dwords++] = UnwrapReadFirstLane(tsharp_high->Arg(i));
         }
     }
 
@@ -366,7 +400,7 @@ void DiscoverImageSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList&
     const IR::Inst* sampler = inst.Arg(1).Inst();
     auto& ssharp = resource.sharps[1];
     for (size_t i = 0; i < sampler->NumArgs(); ++i) {
-        ssharp.dwords[ssharp.num_dwords++] = sampler->Arg(i);
+        ssharp.dwords[ssharp.num_dwords++] = UnwrapReadFirstLane(sampler->Arg(i));
     }
     if (auto [ssharp_dw0, tsharp_dw3, found] = CheckDisableAnisoLod0Pattern(ssharp.dwords[0]);
         found) {
