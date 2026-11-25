@@ -14,7 +14,6 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <string_view>
 #include <array>
 #include <optional>
 
@@ -396,21 +395,16 @@ int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
         pData[i].rightStick.x = states[i].axes[static_cast<int>(Input::Axis::RightX)];
         pData[i].rightStick.y = states[i].axes[static_cast<int>(Input::Axis::RightY)];
         {
-            // A stick at rest is reported as 128. Some games (Nioh's map cursor) treat the centre as
-            // ~127.5 with no deadzone, so 128 reads as a constant tiny down-right push. For those
-            // titles report rest as 127 instead. SHADPS4_STICK_CENTER (0-255) overrides for any game.
+            // Report a stick at rest as 127 rather than 128. Some games (Nioh's map cursor) read the
+            // stick with no deadzone around a centre of ~127.5 and treat 128 as a constant small
+            // down-right push. SHADPS4_STICK_CENTER (0-255) overrides the resting value.
             static const int stick_center = [] {
                 if (const char* env = std::getenv("SHADPS4_STICK_CENTER"); env && env[0]) {
                     return std::clamp(std::atoi(env), 0, 255);
                 }
-                constexpr std::array<std::string_view, 3> center_127_titles{
-                    "CUSA10126", "CUSA03484", "CUSA04736"}; // Nioh
-                const auto serial = Common::ElfInfo::Instance().GameSerial();
-                return std::ranges::find(center_127_titles, serial) != center_127_titles.end()
-                           ? 127
-                           : -1;
+                return 127;
             }();
-            if (stick_center >= 0) {
+            if (stick_center != 128) {
                 for (u8* v : {&pData[i].leftStick.x, &pData[i].leftStick.y, &pData[i].rightStick.x,
                               &pData[i].rightStick.y}) {
                     if (*v == 128) {
