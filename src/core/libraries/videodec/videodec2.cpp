@@ -12,6 +12,11 @@
 namespace Libraries::Videodec2 {
 
 static constexpr u64 kMinimumMemorySize = 16_MB; ///> Fake minimum memory size for querying
+// The HLE decoder (ffmpeg) never touches the compute/decoder memory the game allocates for it, so
+// only ask for a token amount. Requesting 16 MB per region made games with small movie pools fail
+// the allocation (e.g. Nioh's 640x360 skill tutorial movies: allocator returned NULL and the
+// firmware AvPlayer then called sceKernelMtypeprotect on address 0).
+static constexpr u64 kHleWorkMemorySize = 64_KB;
 
 static u64 ComputeFrameSizeBytes(s32 width, s32 height) {
     if (width <= 0 || height <= 0) {
@@ -64,7 +69,7 @@ sceVideodec2QueryComputeMemoryInfo(OrbisVideodec2ComputeMemoryInfo* compute_mem_
     }
 
     compute_mem_info->cpu_gpu_memory = nullptr;
-    compute_mem_info->cpu_gpu_memory_size = kMinimumMemorySize;
+    compute_mem_info->cpu_gpu_memory_size = kHleWorkMemorySize;
     return ORBIS_OK;
 }
 
@@ -158,9 +163,9 @@ sceVideodec2QueryDecoderMemoryInfo(const OrbisVideodec2DecoderConfigInfo* decode
     decoder_mem_info->gpu_memory = nullptr;
     decoder_mem_info->cpu_gpu_memory = nullptr;
 
-    decoder_mem_info->cpu_gpu_memory_size = kMinimumMemorySize;
-    decoder_mem_info->cpu_memory_size = kMinimumMemorySize;
-    decoder_mem_info->gpu_memory_size = kMinimumMemorySize;
+    decoder_mem_info->cpu_gpu_memory_size = kHleWorkMemorySize;
+    decoder_mem_info->cpu_memory_size = kHleWorkMemorySize;
+    decoder_mem_info->gpu_memory_size = kHleWorkMemorySize;
 
     decoder_mem_info->max_frame_buffer_size = max_frame_buffer;
     decoder_mem_info->frame_buffer_alignment = 0x100;
