@@ -274,7 +274,12 @@ SamplerPatchResult CheckClearAnisoRatioAndThresholdPattern(IR::Value value) {
     return {inst->Arg(0), true};
 }
 
-static IR::Value UnwrapReadFirstLane(IR::Value value) {
+static bool IsUndef(const IR::Value& value) {
+    const IR::Inst* inst = value.TryInst();
+    return inst && inst->GetOpcode() == IR::Opcode::UndefU32;
+}
+
+static IR::Value ResolveSharpDword(IR::Value value, u32 depth = 0) {
     // A sharp dword computed in VGPRs and broadcast with v_readfirstlane_b32 is still a
     // uniform sharp dword; look through the broadcast to the real producer.
     while (auto* inst = value.TryInst()) {
@@ -283,7 +288,30 @@ static IR::Value UnwrapReadFirstLane(IR::Value value) {
         }
         value = inst->Arg(0);
     }
-    return value;
+    // A sharp loaded on only one control-flow path reaches its user through a phi whose
+    // other incoming values are undefined (e.g. Phi(UndefU32, ReadConst)). The resource is
+    // only meaningful on the defined path, so use that single defined producer.
+    IR::Inst* phi = value.TryInst();
+    if (!phi || phi->GetOpcode() != IR::Opcode::Phi || depth >= 4) {
+        return value;
+    }
+    IR::Value resolved{};
+    for (size_t i = 0; i < phi->NumArgs(); ++i) {
+        const IR::Value arg = phi->Arg(i);
+        if (IsUndef(arg) || arg.TryInst() == phi) {
+            continue;
+        }
+        const IR::Value source = ResolveSharpDword(arg, depth + 1);
+        if (source.TryInst() == phi) {
+            continue;
+        }
+        if (resolved.IsEmpty()) {
+            resolved = source;
+        } else if (!(resolved == source)) {
+            return value;
+        }
+    }
+    return resolved.IsEmpty() ? value : resolved;
 }
 
 static void WarnUnknownSharpSource(const IR::Inst* source, size_t dword) {
@@ -337,11 +365,7 @@ void DiscoverBufferSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList
     // Gather V# dwords
     vsharp.num_dwords = handle->NumArgs();
     for (size_t i = 0; i < handle->NumArgs(); ++i) {
-        vsharp.dwords[i] = handle->Arg(i);
-        if (auto* inst = vsharp.dwords[i].TryInst();
-            inst && inst->GetOpcode() == IR::Opcode::ReadFirstLane) {
-            vsharp.dwords[i] = inst->Arg(0);
-        }
+        vsharp.dwords[i] = ResolveSharpDword(handle->Arg(i));
     }
 
     // Attempt to "see through" various V# access patterns and have binding reproduce them
@@ -374,11 +398,11 @@ void DiscoverImageSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList&
     // Gather T# dwords
     IR::Inst* tsharp_low = image_handle->Arg(0).Inst();
     for (size_t i = 0; i < tsharp_low->NumArgs(); ++i) {
-        tsharp.dwords[tsharp.num_dwords++] = UnwrapReadFirstLane(tsharp_low->Arg(i));
+        tsharp.dwords[tsharp.num_dwords++] = ResolveSharpDword(tsharp_low->Arg(i));
     }
     if (auto tsharp_high = image_handle->Arg(1).TryInst()) {
         for (size_t i = 0; i < tsharp_high->NumArgs(); ++i) {
-            tsharp.dwords[tsharp.num_dwords++] = UnwrapReadFirstLane(tsharp_high->Arg(i));
+            tsharp.dwords[tsharp.num_dwords++] = ResolveSharpDword(tsharp_high->Arg(i));
         }
     }
 
@@ -400,7 +424,7 @@ void DiscoverImageSharp(IR::Block& block, IR::Inst& inst, ResourceDiscoveryList&
     const IR::Inst* sampler = inst.Arg(1).Inst();
     auto& ssharp = resource.sharps[1];
     for (size_t i = 0; i < sampler->NumArgs(); ++i) {
-        ssharp.dwords[ssharp.num_dwords++] = UnwrapReadFirstLane(sampler->Arg(i));
+        ssharp.dwords[ssharp.num_dwords++] = ResolveSharpDword(sampler->Arg(i));
     }
     if (auto [ssharp_dw0, tsharp_dw3, found] = CheckDisableAnisoLod0Pattern(ssharp.dwords[0]);
         found) {
