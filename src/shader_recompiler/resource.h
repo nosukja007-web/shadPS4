@@ -225,12 +225,19 @@ struct PushData {
     static constexpr u32 XScaleIndex = 2;
     static constexpr u32 YScaleIndex = 3;
     static constexpr u32 BufOffsetIndex = 4;
+    static constexpr u32 FragCoordScaleIndex = BufOffsetIndex + 3;
+    static constexpr u32 ImageScaleIndex = FragCoordScaleIndex + 1;
+    static constexpr u32 ScaledImagesIndex = ImageScaleIndex + 1;
 
     float xoffset;
     float yoffset;
     float xscale;
     float yscale;
     std::array<u8, NUM_BUFFERS> buf_offsets;
+    float frag_coord_scale; ///< Maps host FragCoord.xy back to guest pixels (1 / render scale).
+    u32 image_scale;        ///< Host scale of images flagged in scaled_images.
+    /// Bit i set: shader image i is scaled. Words 0-1 for non-fragment stages, 2-3 for fragment.
+    alignas(16) std::array<u32, 4> scaled_images;
 
     void AddOffset(u32 binding, u32 offset) {
         ASSERT(offset < 256 && binding < buf_offsets.size());

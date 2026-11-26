@@ -3,8 +3,11 @@
 
 #pragma once
 
+#include <optional>
+#include <unordered_map>
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
+#include "shader_recompiler/frontend/copy_shader.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -71,6 +74,9 @@ public:
 
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
+    /// Handles IT_STRMOUT_BUFFER_UPDATE for GS stream-out emulated with transform feedback.
+    void StreamoutBufferUpdate(u32 buffer, u32 source_select, bool update_memory, VAddr dst_addr,
+                               VAddr src_addr, u32 offset_dw);
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
@@ -128,6 +134,13 @@ private:
 
     void ResetBindings(bool is_compute);
 
+    /// Binds the guest stream-out buffers of a stream-out pipeline. Must run before rendering
+    /// begins (may record transfers). Returns true when transform feedback is active.
+    bool PrepareTransformFeedback(const GraphicsPipeline* pipeline);
+    void BeginTransformFeedback();
+    void EndTransformFeedback();
+    VideoCore::Buffer* GetXfbCounterBuffer();
+
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
     bool IsComputeImageClear(const Pipeline* pipeline);
@@ -173,8 +186,26 @@ private:
     Pipeline::DescriptorWrites set_writes;
     Shader::PushData push_data;
 
+    struct XfbBinding {
+        vk::Buffer buffer;
+        vk::DeviceSize offset;
+        vk::DeviceSize size;
+    };
+    std::array<XfbBinding, 4> xfb_bindings{};
+    u32 xfb_active_mask{};
+    u32 xfb_counter_init_mask{0xF};              ///< Counters that must be (re)initialized
+    std::array<u32, 4> xfb_counter_init_value{}; ///< Byte offsets for those counters
+    std::unique_ptr<VideoCore::Buffer> xfb_counter_buffer;
+    std::unordered_map<u64, Shader::CopyShaderData> xfb_copy_shaders;
+
     bool attachment_feedback_loop{};
     bool needs_barrier{};
+    u32 render_scale{1}; ///< Host resolution multiplier of the current render pass attachments.
+    /// Depth clear limited to the clearing draw's area, recorded once the pass has begun.
+    std::optional<vk::ClearRect> pending_depth_clear{};
+    float pending_depth_clear_value{};
+
+    void FlushPendingDepthClear();
 };
 
 } // namespace Vulkan

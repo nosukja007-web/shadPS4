@@ -50,6 +50,44 @@ static Id FixImageCoords(EmitContext& ctx, Id coords, AmdGpu::ImageType image_ty
     }
 }
 
+static bool IsScalableViewType(AmdGpu::ImageType image_type) {
+    return image_type == AmdGpu::ImageType::Color2D ||
+           image_type == AmdGpu::ImageType::Color2DMsaa ||
+           image_type == AmdGpu::ImageType::Color2DArray;
+}
+
+/// Returns the host scale (as u32) of the image at the given shader index: the resolution scale
+/// when the rasterizer flagged the bound image as upscaled, 1 otherwise.
+static Id ImageHostScale(EmitContext& ctx, u32 index) {
+    const u32 slot = ctx.hw_stage == HwStage::Fragment ? 2 : 0;
+    const Id u32_ptr = ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]);
+    const Id mask =
+        ctx.OpLoad(ctx.U32[1], ctx.OpAccessChain(u32_ptr, ctx.push_data_block,
+                                                 ctx.ConstU32(PushData::ScaledImagesIndex),
+                                                 ctx.ConstU32(slot + index / 32)));
+    const Id bit = ctx.OpBitwiseAnd(ctx.U32[1], mask, ctx.ConstU32(1u << (index % 32)));
+    const Id is_scaled = ctx.OpINotEqual(ctx.U1[1], bit, ctx.u32_zero_value);
+    const Id scale = ctx.OpLoad(
+        ctx.U32[1],
+        ctx.OpAccessChain(u32_ptr, ctx.push_data_block, ctx.ConstU32(PushData::ImageScaleIndex)));
+    return ctx.OpSelect(ctx.U32[1], is_scaled, scale, ctx.ConstU32(1U));
+}
+
+/// Maps guest integer texel coordinates to the host image when it is upscaled.
+static Id ScaleImageCoords(EmitContext& ctx, u32 index, Id coords, AmdGpu::ImageType image_type) {
+    if (!IsScalableViewType(image_type)) {
+        return coords;
+    }
+    const Id scale = ImageHostScale(ctx, index);
+    const Id x = ctx.OpIMul(ctx.U32[1], ctx.OpCompositeExtract(ctx.U32[1], coords, 0U), scale);
+    const Id y = ctx.OpIMul(ctx.U32[1], ctx.OpCompositeExtract(ctx.U32[1], coords, 1U), scale);
+    if (image_type == AmdGpu::ImageType::Color2DArray) {
+        const Id slice = ctx.OpCompositeExtract(ctx.U32[1], coords, 2U);
+        return ctx.OpCompositeConstruct(ctx.U32[3], x, y, slice);
+    }
+    return ctx.OpCompositeConstruct(ctx.U32[2], x, y);
+}
+
 template <bool is_float>
 static Id PadImageOperand(EmitContext& ctx, Id operand, AmdGpu::ImageType image_type) {
     if (image_type == AmdGpu::ImageType::Color1D || image_type == AmdGpu::ImageType::Color1DArray) {
@@ -265,9 +303,20 @@ Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, u32 handle, Id lod
         return ctx.OpCompositeConstruct(ctx.U32[4], width, slices, zero, mips());
     }
     case AmdGpu::ImageType::Color2D:
-    case AmdGpu::ImageType::Color2DMsaa:
-        return ctx.OpCompositeConstruct(ctx.U32[4], query(ctx.U32[2]), zero, mips());
-    case AmdGpu::ImageType::Color2DArray:
+    case AmdGpu::ImageType::Color2DMsaa: {
+        // Report the guest size of upscaled images.
+        const Id scale = ImageHostScale(ctx, handle & 0xFFFF);
+        const Id size = ctx.OpUDiv(ctx.U32[2], query(ctx.U32[2]),
+                                   ctx.OpCompositeConstruct(ctx.U32[2], scale, scale));
+        return ctx.OpCompositeConstruct(ctx.U32[4], size, zero, mips());
+    }
+    case AmdGpu::ImageType::Color2DArray: {
+        const Id scale = ImageHostScale(ctx, handle & 0xFFFF);
+        const Id size = ctx.OpUDiv(ctx.U32[3], query(ctx.U32[3]),
+                                   ctx.OpCompositeConstruct(ctx.U32[3], scale, scale,
+                                                            ctx.ConstU32(1U)));
+        return ctx.OpCompositeConstruct(ctx.U32[4], size, mips());
+    }
     case AmdGpu::ImageType::Cube:
     case AmdGpu::ImageType::Color3D:
         return ctx.OpCompositeConstruct(ctx.U32[4], query(ctx.U32[3]), mips());
@@ -304,7 +353,9 @@ Id EmitImageGradient(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id
 Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod, Id ms) {
     const auto& texture = ctx.images[handle & 0xFFFF];
     const Id color_type = texture.data_types->Get(4);
-    const Id fixed_coords = FixImageCoords<false>(ctx, coords, texture.view_type);
+    const Id fixed_coords = ScaleImageCoords(
+        ctx, handle & 0xFFFF, FixImageCoords<false>(ctx, coords, texture.view_type),
+        texture.view_type);
     ImageOperands operands;
     Id texel;
     if (!texture.is_storage) {
@@ -353,7 +404,11 @@ void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id 
     const auto& texture = ctx.images[handle & 0xFFFF];
     Id image_ptr = texture.id;
     const Id color_type = texture.data_types->Get(4);
-    const Id fixed_coords = FixImageCoords<false>(ctx, coords, texture.view_type);
+    const Id fixed_coords = ScaleImageCoords(
+        ctx, handle & 0xFFFF, FixImageCoords<false>(ctx, coords, texture.view_type),
+        texture.view_type);
+    const bool replicate = IsScalableViewType(texture.view_type);
+    const Id scale = replicate ? ImageHostScale(ctx, handle & 0xFFFF) : Id{};
     ImageOperands operands;
     operands.Add(spv::ImageOperandsMask::Sample, ms);
     if (ctx.profile.supports_image_load_store_lod) {
@@ -368,6 +423,37 @@ void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id 
     const Id image = ctx.OpLoad(texture.image_type, image_ptr);
     const Id texel = texture.is_integer ? ctx.OpBitcast(color_type, color) : color;
     ctx.OpImageWrite(image, fixed_coords, texel, operands.mask, operands.operands);
+    if (!replicate) {
+        return;
+    }
+
+    // A guest texel covers scale x scale host texels of an upscaled image: fill the whole block.
+    constexpr u32 MaxScale = 4;
+    const Id x = ctx.OpCompositeExtract(ctx.U32[1], fixed_coords, 0U);
+    const Id y = ctx.OpCompositeExtract(ctx.U32[1], fixed_coords, 1U);
+    for (u32 j = 0; j < MaxScale; ++j) {
+        for (u32 i = 0; i < MaxScale; ++i) {
+            if (i == 0 && j == 0) {
+                continue;
+            }
+            const Id in_block = ctx.OpULessThan(ctx.U1[1], ctx.ConstU32(std::max(i, j)), scale);
+            const Id write_label{ctx.OpLabel()};
+            const Id merge_label{ctx.OpLabel()};
+            ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+            ctx.OpBranchConditional(in_block, write_label, merge_label);
+            ctx.AddLabel(write_label);
+            const Id tx = ctx.OpIAdd(ctx.U32[1], x, ctx.ConstU32(i));
+            const Id ty = ctx.OpIAdd(ctx.U32[1], y, ctx.ConstU32(j));
+            const Id block_coords =
+                texture.view_type == AmdGpu::ImageType::Color2DArray
+                    ? ctx.OpCompositeConstruct(ctx.U32[3], tx, ty,
+                                               ctx.OpCompositeExtract(ctx.U32[1], fixed_coords, 2U))
+                    : ctx.OpCompositeConstruct(ctx.U32[2], tx, ty);
+            ctx.OpImageWrite(image, block_coords, texel, operands.mask, operands.operands);
+            ctx.OpBranch(merge_label);
+            ctx.AddLabel(merge_label);
+        }
+    }
 }
 
 static Id SelectCubeResult(EmitContext& ctx, Id x, Id y, Id z, Id x_res, Id y_res, Id z_res) {

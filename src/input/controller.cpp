@@ -83,6 +83,28 @@ int GameController::ReadStates(State* states, int states_num) {
         return 1;
     }
 
+    // The queue fills at the input event rate, which can be far above the 250 Hz of a real pad.
+    // If the game reads fewer reports than were queued, hand it the newest ones instead of
+    // letting a backlog build up, which would replay old stick motion late.
+    u64 dropped = 0;
+    while (m_states_queue.Size() > static_cast<u64>(states_num)) {
+        m_states_queue.Pop();
+        ++dropped;
+    }
+    {
+        static u64 stat_calls = 0, stat_requested = 0, stat_dropped = 0, stat_last = 0;
+        stat_calls++;
+        stat_requested += states_num;
+        stat_dropped += dropped;
+        const u64 now = Libraries::Kernel::sceKernelGetProcessTime();
+        if (now - stat_last > 5'000'000) {
+            LOG_INFO(Input, "Pad read stats: {} multi-reads, avg num {}, dropped {} stale reports",
+                     stat_calls, stat_requested / stat_calls, stat_dropped);
+            stat_calls = stat_requested = stat_dropped = 0;
+            stat_last = now;
+        }
+    }
+
     int read_count = 0;
     while (read_count < states_num) {
         auto state = m_states_queue.Pop();
@@ -109,7 +131,25 @@ void GameController::Axis(Input::Axis axis, int value, bool smooth) {
 
 void GameController::UpdateGyro(const float gyro[3]) {
     std::lock_guard lock{m_state_mutex};
-    std::memcpy(gyro_buf, gyro, sizeof(gyro_buf));
+    // A real pad's library tracks the gyro's zero-rate bias while the pad is still and removes
+    // it. Without that, a DS4 lying on the desk reports a small constant rotation (~0.01 rad/s)
+    // and the integrated orientation drifts forever, which moves motion-driven cursors on their
+    // own. Learn the bias slowly whenever the corrected rate stays near zero.
+    constexpr float StillRate = 0.06f; // rad/s, ~3.4 deg/s
+    constexpr float BiasAlpha = 0.005f;
+    float corrected_sq = 0.0f;
+    for (int i = 0; i < 3; ++i) {
+        const float c = gyro[i] - m_gyro_bias[i];
+        corrected_sq += c * c;
+    }
+    if (corrected_sq < StillRate * StillRate) {
+        for (int i = 0; i < 3; ++i) {
+            m_gyro_bias[i] += (gyro[i] - m_gyro_bias[i]) * BiasAlpha;
+        }
+    }
+    for (int i = 0; i < 3; ++i) {
+        gyro_buf[i] = gyro[i] - m_gyro_bias[i];
+    }
 }
 
 void GameController::UpdateAcceleration(const float acceleration[3]) {
@@ -179,6 +219,7 @@ void GameController::DisconnectController() {
     m_state = {};
     m_state.connected_count = connected_count;
     std::fill(gyro_buf, gyro_buf + 3, 0.0f);
+    std::fill(m_gyro_bias, m_gyro_bias + 3, 0.0f);
     std::fill(accel_buf, accel_buf + 3, 0.0f);
     accel_buf[1] = 9.81f;
     m_next_touch_id = 1;
@@ -195,8 +236,14 @@ void GameController::UpdateOrientationLocked(u64 timestamp) {
     }
     const float delta_time =
         static_cast<float>(timestamp - m_last_orientation_update) / 1'000'000.f;
+    // Dead-band tiny residual rates (sensor noise) so a still pad keeps a still orientation.
+    constexpr float DeadbandRate = 0.02f; // rad/s, ~1.1 deg/s
+    Libraries::Pad::OrbisFVector3 rate = m_state.angularVelocity;
+    if (rate.x * rate.x + rate.y * rate.y + rate.z * rate.z < DeadbandRate * DeadbandRate) {
+        rate = {0.0f, 0.0f, 0.0f};
+    }
     Libraries::Pad::OrbisFQuaternion orientation{};
-    CalculateOrientation(m_state.angularVelocity, delta_time, m_state.orientation, orientation);
+    CalculateOrientation(rate, delta_time, m_state.orientation, orientation);
     m_state.orientation = orientation;
     m_last_orientation_update = timestamp;
 }
@@ -212,7 +259,14 @@ void GameController::PushStateLocked(u64 timestamp) {
     m_state.time = timestamp;
     m_state.touch_time_since_held_down =
         m_touch_down_timestamp == 0 ? 0 : timestamp - m_touch_down_timestamp;
-    m_states_queue.Push(m_state);
+    // Queue reports at most every 4 ms (a real pad's 250 Hz) unless a button or the connection
+    // changed; the 4 ms poll timer queues the latest stick values in between.
+    const bool force = m_state.buttonsState != m_last_queue_buttons || !m_state.connected;
+    if (force || timestamp - m_last_queue_push >= 4000 || timestamp < m_last_queue_push) {
+        m_states_queue.Push(m_state);
+        m_last_queue_push = timestamp;
+        m_last_queue_buttons = m_state.buttonsState;
+    }
 }
 
 void GameController::SetLightBarRGB(u8 const r, u8 const g, u8 const b) {

@@ -269,6 +269,11 @@ public:
         return features.geometryShader;
     }
 
+    /// Returns true when VK_EXT_transform_feedback is supported and enabled
+    bool IsTransformFeedbackSupported() const {
+        return transform_feedback;
+    }
+
     /// Returns true when tessellation is supported by the device
     bool IsTessellationSupported() const {
         return features.tessellationShader;
@@ -279,6 +284,9 @@ public:
     bool IsShaderSubgroupClockSupported() const {
         return shader_clock && shader_clock_features.shaderSubgroupClock;
     }
+
+    /// Logs VK_EXT_device_fault information after a device loss, if available.
+    void ReportDeviceFault() const;
 
     /// Returns the vendor ID of the physical device
     u32 GetVendorID() const {
@@ -513,6 +521,7 @@ private:
     vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock_features;
     vk::DriverIdKHR driver_id;
     vk::UniqueDebugUtilsMessengerEXT debug_callback{};
+    vk::UniqueDebugUtilsMessengerEXT address_messenger{};
     std::string vendor_name;
     VmaAllocator allocator{};
     vk::Queue present_queue;
@@ -532,6 +541,7 @@ private:
     bool vertex_input_dynamic_state{};
     bool list_restart{};
     bool provoking_vertex{};
+    bool transform_feedback{};
     bool shader_stencil_export{};
     bool image_load_store_lod{};
     bool amd_gcn_shader{};
@@ -548,6 +558,8 @@ private:
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
     bool shader_clock{};
+    bool device_fault{};
+    bool address_binding_report{};
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};

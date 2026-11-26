@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -38,6 +39,7 @@ namespace Common::Log {
 
 static std::shared_ptr<spdlog_stdout> g_console_sink;
 static std::shared_ptr<LogFileSink> g_shad_file_sink;
+static std::shared_ptr<spdlog::sinks::async_sink> g_async_sink;
 static std::array<std::unique_ptr<spdlog::logger>, NUM_LOG_CLASSES> ALL_LOGGERS{};
 
 std::array<Level, NUM_LOG_CLASSES> g_class_levels{};
@@ -163,11 +165,19 @@ void Shutdown() {
         logger.reset();
     }
 
+    g_async_sink.reset();
     g_shad_file_sink.reset();
     g_console_sink.reset();
 }
 
 void Flush() {
+    // With async logging, queued messages are only written by the worker thread. Drain the
+    // queue first (bounded wait) so lines logged right before a crash or exit are not lost.
+    if (auto async = g_async_sink; async != nullptr) {
+        async->flush();
+        async->wait_all(std::chrono::milliseconds(500));
+    }
+
     if (g_shad_file_sink != nullptr) {
         g_shad_file_sink->flush();
     }
@@ -180,8 +190,9 @@ void Flush() {
 void UpdateSinks() {
     std::initializer_list<spdlog::sink_ptr> sinks{g_console_sink, g_shad_file_sink};
 
-    std::initializer_list<spdlog::sink_ptr> async_sink{std::make_shared<spdlog::sinks::async_sink>(
-        spdlog::sinks::async_sink::config{.sinks = sinks})};
+    g_async_sink = std::make_shared<spdlog::sinks::async_sink>(
+        spdlog::sinks::async_sink::config{.sinks = sinks});
+    std::initializer_list<spdlog::sink_ptr> async_sink{g_async_sink};
 
     std::initializer_list<spdlog::sink_ptr> dup_filter{
         std::make_shared<spdlog::sinks::dup_filter_sink_mt>(

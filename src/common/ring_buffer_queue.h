@@ -41,6 +41,10 @@ public:
         return m_storage[m_begin];
     }
 
+    u64 Size() const {
+        return m_size;
+    }
+
     void Clear() {
         m_begin = 0;
         m_size = 0;

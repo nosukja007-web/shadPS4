@@ -20,12 +20,30 @@
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
+#include "video_core/watch_addr.h"
 
 namespace VideoCore {
 
 static constexpr u32 MAX_IMAGES = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_IMAGE_VIEWS = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_SAMPLERS = std::numeric_limits<u16>::max();
+
+static std::string WatchDesc(const Image& img) {
+    return fmt::format("uid={} {} {}x{} layers={} tile={} size={:#x} scale={} flags={:#x} "
+                       "gpu_valid={} htile={:#x}",
+                       img.image_uid, vk::to_string(img.info.pixel_format), img.info.size.width,
+                       img.info.size.height, img.info.resources.layers,
+                       static_cast<u32>(img.info.tile_mode), img.info.guest_size, img.scale,
+                       static_cast<u32>(img.flags), img.HasGpuValidData(),
+                       img.info.meta_info.htile_addr);
+}
+
+static VAddr WatchImage(const Image& img) {
+    if (!Watch::Enabled()) {
+        return 0;
+    }
+    return Watch::Hit(img.info.guest_address, img.info.guest_size);
+}
 
 static u64 HashBackingMemory(VAddr virtual_addr, u64 size) {
     static constexpr std::array<u8, Core::GUEST_PAGE_SIZE> zeros{};
@@ -47,6 +65,50 @@ static u64 HashBackingMemory(VAddr virtual_addr, u64 size) {
     const u64 hash = XXH3_64bits_digest(state);
     XXH3_freeState(state);
     return hash;
+}
+
+/// Returns true if an image with this layout can have an upscaled host image at all.
+static bool CanScaleImage(const ImageInfo& info) {
+    return info.pixel_format != vk::Format::eUndefined &&
+           (info.type == AmdGpu::ImageType::Color2D ||
+            info.type == AmdGpu::ImageType::Color2DArray) &&
+           !info.props.is_block && info.num_samples == 1;
+}
+
+/// Picks the host resolution multiplier for a newly created render or depth target.
+/// Square targets (shadow maps, LUTs), small targets, MSAA and mipmapped targets stay native,
+/// as do targets the guest has written as storage images.
+static u32 DecideResolutionScale(const Vulkan::Instance& instance, const ImageInfo& info,
+                                 const absl::flat_hash_set<VAddr>& unscalable_addresses) {
+    const u32 scale = EmulatorSettings.GetResolutionScale();
+    if (scale <= 1 || unscalable_addresses.contains(info.guest_address)) {
+        return 1;
+    }
+    if (!CanScaleImage(info)) {
+        return 1;
+    }
+    const u32 width = info.size.width;
+    const u32 height = info.size.height;
+    if (width < 256 || height < 256 || width == height) {
+        return 1;
+    }
+    // Diagnostic filter: SHADPS4_RES_SCALE_ONLY=WxH[,WxH...] scales only targets of those sizes.
+    static const std::string only_sizes = [] {
+        const char* env = std::getenv("SHADPS4_RES_SCALE_ONLY");
+        return env ? std::string{env} : std::string{};
+    }();
+    if (!only_sizes.empty() &&
+        only_sizes.find(fmt::format("{}x{}", width, height)) == std::string::npos) {
+        return 1;
+    }
+    if (width * scale > instance.GetMaxFramebufferWidth() ||
+        height * scale > instance.GetMaxFramebufferHeight()) {
+        return 1;
+    }
+    LOG_INFO(Render_Vulkan, "Scaling {} target {:#x} {}x{} layers {} {} by {}x",
+             info.props.is_depth ? "depth" : "color", info.guest_address, width, height,
+             info.resources.layers, vk::to_string(info.pixel_format), scale);
+    return scale;
 }
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
@@ -105,6 +167,10 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
+    }
+    if (const VAddr wb = WatchImage(image)) {
+        Watch::Log("download_to_ram", wb, "{} dl_flags={:#x}", WatchDesc(image),
+                   static_cast<u32>(flags));
     }
     const auto image_addr = image.info.guest_address;
     const auto image_size = image.info.guest_size;
@@ -194,6 +260,10 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
 
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
+        if (const VAddr wb = WatchImage(image)) {
+            Watch::Log("cpu_write_invalidate", wb, "write [{:#x},+{:#x}) overlaps={} {}", addr,
+                       size, image.Overlaps(addr, size), WatchDesc(image));
+        }
         if (image.Overlaps(addr, size)) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
@@ -227,6 +297,10 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         }
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
+        if (const VAddr wb = WatchImage(image)) {
+            Watch::Log("gpu_dirty_from_dma", wb, "dst [{:#x},+{:#x}) {}", address, max_size,
+                       WatchDesc(image));
+        }
     });
 }
 
@@ -297,7 +371,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         auto new_info = requested_info;
         new_info.resources = std::max(requested_info.resources, cache_image.info.resources);
         new_info.UpdateSize();
-        const auto new_image_id = slot_images.Insert(instance, runtime, slot_image_views, new_info);
+        const auto new_image_id = slot_images.Insert(instance, runtime, slot_image_views, new_info,
+                                                     cache_image.scale);
         RegisterImage(new_image_id);
 
         // Inherit image usage
@@ -545,8 +620,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                 // Otherwise it's later created from guest memory and the GPU data is lost
                 // And reads/writes go to different images.
                 if (!merged_image_id) {
-                    merged_image_id =
-                        slot_images.Insert(instance, runtime, slot_image_views, image_info);
+                    merged_image_id = slot_images.Insert(instance, runtime, slot_image_views,
+                                                         image_info, cache_image.scale);
                     RegisterImage(merged_image_id);
                     RefreshImage(slot_images[merged_image_id]);
                     TrackImage(merged_image_id);
@@ -562,7 +637,11 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
-    const auto new_image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
+    // Keep the source scale only where a scaled image is still allowed.
+    const u32 src_scale = slot_images[image_id].scale;
+    const u32 new_scale = CanScaleImage(info) ? src_scale : 1u;
+    const auto new_image_id =
+        slot_images.Insert(instance, runtime, slot_image_views, info, new_scale);
     RegisterImage(new_image_id);
 
     auto& src_image = slot_images[image_id];
@@ -586,6 +665,46 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     }
     FreeImage(image_id);
 
+    return new_image_id;
+}
+
+ImageId TextureCache::MatchTargetScale(ImageId image_id, u32 scale) {
+    const Image& image = slot_images[image_id];
+    if (image.scale == scale || !CanScaleImage(image.info) ||
+        image.info.size.width * scale > instance.GetMaxFramebufferWidth() ||
+        image.info.size.height * scale > instance.GetMaxFramebufferHeight()) {
+        return image_id;
+    }
+    LOG_INFO(Render_Vulkan, "Rescaling target {:#x} {}x{} {} from {}x to {}x to match its pass",
+             image.info.guest_address, image.info.size.width, image.info.size.height,
+             vk::to_string(image.info.pixel_format), image.scale, scale);
+    return RescaleImage(image_id, scale);
+}
+
+ImageId TextureCache::RescaleImage(ImageId image_id, u32 new_scale) {
+    const ImageInfo info = slot_images[image_id].info;
+    const auto new_image_id =
+        slot_images.Insert(instance, runtime, slot_image_views, info, new_scale);
+    RegisterImage(new_image_id);
+
+    auto& src_image = slot_images[image_id];
+    auto& new_image = slot_images[new_image_id];
+    const bool src_has_gpu_data = src_image.HasGpuValidData();
+
+    RefreshImage(new_image);
+    if (src_image.binding.is_bound || src_image.binding.is_target) {
+        src_image.binding.needs_rebind = 1u;
+    }
+    new_image.usage = src_image.usage;
+    new_image.depth_id = src_image.depth_id;
+    new_image.depth_uid = src_image.depth_uid;
+
+    TrackImage(new_image_id);
+    new_image.flags &= ~ImageFlagBits::Dirty;
+    if (src_has_gpu_data) {
+        runtime.CopyImage(&src_image, &new_image);
+    }
+    FreeImage(image_id);
     return new_image_id;
 }
 
@@ -655,13 +774,39 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     // Create and register a new image
     if (!image_id) {
-        image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
+        const bool is_target =
+            desc.type == BindingType::RenderTarget || desc.type == BindingType::DepthTarget;
+        const u32 scale =
+            is_target ? DecideResolutionScale(instance, info, unscalable_addresses) : 1u;
+        image_id = slot_images.Insert(instance, runtime, slot_image_views, info, scale);
         RegisterImage(image_id);
+    } else if (view_mip <= 0 && view_slice <= 0) {
+        // Storage writes to upscaled images are replicated over the host texel block by the
+        // shader, so only native targets need attention here.
+        const Image& existing = slot_images[image_id];
+        if ((desc.type == BindingType::RenderTarget || desc.type == BindingType::DepthTarget) &&
+            !existing.IsScaled()) {
+            // A target first seen as a texture would otherwise mix scales in a render pass.
+            if (const u32 scale =
+                    DecideResolutionScale(instance, existing.info, unscalable_addresses);
+                scale > 1) {
+                image_id = RescaleImage(image_id, scale);
+            }
+        }
     }
 
     Image& image = slot_images[image_id];
     image.tick_accessed_last = scheduler.CurrentTick();
     TouchImage(image);
+    if (const VAddr wb = WatchImage(image)) {
+        static constexpr std::array<const char*, 5> type_names{"find_texture", "find_storage",
+                                                               "find_rt", "find_depth_target",
+                                                               "find_other"};
+        const auto t = std::min<size_t>(static_cast<size_t>(desc.type), type_names.size() - 1);
+        Watch::Log(type_names[t], wb, "req {} {}x{} tile={} -> {}",
+                   vk::to_string(info.pixel_format), info.size.width, info.size.height,
+                   static_cast<u32>(info.tile_mode), WatchDesc(image));
+    }
 
     // If the image requested is a subresource of the image from cache record its location.
     if (view_mip > 0) {
@@ -707,6 +852,12 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
+        if (image.IsScaled() && !image.usage.storage) {
+            LOG_INFO(Render_Vulkan, "Scaled image {:#x} {}x{} {} bound as storage",
+                     image.info.guest_address, image.info.size.width, image.info.size.height,
+                     vk::to_string(image.info.pixel_format));
+            image.usage.storage = 1u;
+        }
         image.flags |= ImageFlagBits::GpuModified;
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
             image.info.guest_address != 0) {
@@ -840,6 +991,45 @@ void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_inf
     stencil_image.AssociateDepth(depth_id, slot_images[depth_id].image_uid);
 }
 
+ImageId TextureCache::GetStencilColorCopy(ImageId depth_id) {
+    ASSERT(slot_images[depth_id].aspect_mask & vk::ImageAspectFlagBits::eStencil);
+    if (!slot_images[depth_id].stencil_color_id) {
+        const ImageInfo& depth_info = slot_images[depth_id].info;
+        const u32 depth_scale = slot_images[depth_id].scale;
+        ImageInfo info = depth_info;
+        info.props = {};
+        info.pixel_format = vk::Format::eR8Unorm;
+        info.num_bits = 8;
+        info.num_samples = 1;
+        info.meta_info = {};
+        if (info.stencil_addr != 0) {
+            info.guest_address = info.stencil_addr;
+            info.guest_size = info.stencil_size;
+        }
+        // The copy is never registered or tracked: it lives and dies with the depth image.
+        // Insert may reallocate slot storage, so the depth image is looked up again after it.
+        const ImageId color_id =
+            slot_images.Insert(instance, runtime, slot_image_views, info, depth_scale);
+        Image& depth_image = slot_images[depth_id];
+        depth_image.stencil_color_id = color_id;
+        depth_image.stencil_color_tick = ~0ULL;
+        LOG_INFO(Render_Vulkan,
+                 "Created R8 stencil copy for depth image {:#x} {}x{} layers {} scale {}",
+                 depth_image.info.guest_address, depth_image.info.size.width,
+                 depth_image.info.size.height, depth_image.info.resources.layers,
+                 depth_image.scale);
+    }
+    Image& depth_image = slot_images[depth_id];
+    const ImageId color_id = depth_image.stencil_color_id;
+    if (depth_image.stencil_color_tick != depth_image.write_tick) {
+        Image& color_image = slot_images[color_id];
+        runtime.CopyStencilToColor(&depth_image, &color_image);
+        // The copy only reads the depth image, so write_tick is unchanged here.
+        depth_image.stencil_color_tick = depth_image.write_tick;
+    }
+    return color_id;
+}
+
 void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
@@ -868,6 +1058,10 @@ void TextureCache::RefreshImage(Image& image) {
         image.cpu_hash = hash;
     }
 
+    if (const VAddr wb = WatchImage(image)) {
+        Watch::Log("upload_from_memory", wb,
+                   "(re)upload, contents replaced by guest/buffer data {}", WatchDesc(image));
+    }
     image.gpu_hash = 0;
 
     const u32 num_layers = image.info.resources.layers;
@@ -937,6 +1131,9 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    if (const VAddr wb = WatchImage(image)) {
+        Watch::Log("create", wb, "{}", WatchDesc(image));
+    }
     image.memory_usage_counter = &total_used_memory;
     total_used_memory += Common::AlignUp(image.SizeBytes(), 1024);
     image_lru_cache.Insert(image, gc_tick);
@@ -956,6 +1153,9 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
+    if (const VAddr wb = WatchImage(image)) {
+        Watch::Log("unregister", wb, "{}", WatchDesc(image));
+    }
     image.memory_usage_counter = nullptr;
     image_lru_cache.Free(image);
     total_used_memory -= Common::AlignUp(image.SizeBytes(), 1024);
@@ -1103,6 +1303,10 @@ void TextureCache::GarbageCollectImages() {
         if (download && (!pressured || !image.CanBeDownloaded())) {
             return false;
         }
+        if (const VAddr wb = WatchImage(image)) {
+            Watch::Log("gc_evict", wb, "download={} pressured={} {}", download, pressured,
+                       WatchDesc(image));
+        }
         --num_deletions;
         const auto image_id = slot_images.GetSlotId(image);
         if (download) {
@@ -1225,6 +1429,10 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::TouchImage(Image& image) {
+    // Unregistered images are not linked in the LRU list; touching them would corrupt it.
+    if (False(image.flags & ImageFlagBits::Registered)) {
+        return;
+    }
     image_lru_cache.Touch(image, gc_tick);
 }
 
@@ -1232,6 +1440,9 @@ void TextureCache::DeleteImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(image.IsUntracked(), "Image was not untracked");
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");
+    if (const VAddr wb = WatchImage(image)) {
+        Watch::Log("delete", wb, "{}", WatchDesc(image));
+    }
 
     // Remove any registered meta areas.
     const auto& meta_info = image.info.meta_info;
@@ -1250,6 +1461,11 @@ void TextureCache::DeleteImage(ImageId image_id) {
         if (download_images.contains(image_id)) {
             download_images.erase(image_id);
         }
+    }
+
+    // Delete the unregistered stencil color copy owned by this image.
+    if (const ImageId stencil_color_id = std::exchange(image.stencil_color_id, ImageId{})) {
+        DeleteImage(stencil_color_id);
     }
 
     // Reclaim image and any image views it references.

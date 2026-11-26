@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <filesystem>
 #include <functional>
@@ -434,6 +435,7 @@ struct GPUSettings {
     Setting<bool> userfaultfd{false};
     Setting<bool> inline_fetch_shader{false};
     Setting<bool> fast_shader_math{false};
+    Setting<u32> resolution_scale{1};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -459,6 +461,7 @@ struct GPUSettings {
             make_override<GPUSettings>("userfaultfd", &GPUSettings::userfaultfd),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
             make_override<GPUSettings>("fast_shader_math", &GPUSettings::fast_shader_math),
+            make_override<GPUSettings>("resolution_scale", &GPUSettings::resolution_scale),
         };
     }
 };
@@ -468,7 +471,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    direct_memory_access_enabled, dump_shaders, patch_shaders,
                                    vblank_frequency, full_screen, full_screen_mode, present_mode,
                                    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
-                                   userfaultfd, inline_fetch_shader, fast_shader_math)
+                                   userfaultfd, inline_fetch_shader, fast_shader_math,
+                                   resolution_scale)
 
 // -------------------------------
 // Vulkan settings
@@ -765,6 +769,16 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, UserfaultfdTracking, userfaultfd)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, FastShaderMath, fast_shader_math)
+
+    u32 GetResolutionScale() const {
+        // SHADPS4_RESOLUTION_SCALE overrides the configured value for one run.
+        static const u32 env_scale = [] {
+            const char* env = std::getenv("SHADPS4_RESOLUTION_SCALE");
+            return env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
+        }();
+        const u32 scale = env_scale ? env_scale : m_gpu.resolution_scale.get(m_configMode);
+        return std::clamp<u32>(scale, 1u, 4u);
+    }
 
     u32 GetVblankFrequency() {
         if (m_gpu.vblank_frequency.value < 30) {

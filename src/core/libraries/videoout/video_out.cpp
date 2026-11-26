@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
@@ -237,7 +238,7 @@ s32 PS4_SYSV_ABI sceVideoOutGetEventCount(const Kernel::OrbisKernelEvent* ev) {
         return ORBIS_VIDEO_OUT_ERROR_INVALID_EVENT;
     }
 
-    auto event_data = static_cast<OrbisVideoOutEventData>(ev->data);
+    auto event_data = std::bit_cast<OrbisVideoOutEventData>(ev->data);
     return event_data.count;
 }
 
@@ -401,7 +402,11 @@ s32 PS4_SYSV_ABI sceVideoOutAdjustColor(s32 handle, const SceVideoOutColorSettin
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
 
-    presenter->GetPPSettingsRef().gamma = settings->gamma;
+    auto& pp_gamma = presenter->GetPPSettingsRef().gamma;
+    if (pp_gamma != settings->gamma) {
+        LOG_INFO(Lib_VideoOut, "Display gamma (game brightness) set to {}", settings->gamma);
+    }
+    pp_gamma = settings->gamma;
     return ORBIS_OK;
 }
 

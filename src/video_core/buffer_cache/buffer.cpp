@@ -131,6 +131,12 @@ vk::BufferUsageFlags SupportedUsage(const Vulkan::Instance& instance, vk::Buffer
     if (!instance.IsBufferDeviceAddressSupported()) {
         usage &= ~vk::BufferUsageFlagBits::eShaderDeviceAddress;
     }
+    if (instance.IsTransformFeedbackSupported() &&
+        (usage & vk::BufferUsageFlagBits::eStorageBuffer)) {
+        // Guest memory may be the target of GS stream-out.
+        usage |= vk::BufferUsageFlagBits::eTransformFeedbackBufferEXT |
+                 vk::BufferUsageFlagBits::eTransformFeedbackCounterBufferEXT;
+    }
     return usage;
 }
 

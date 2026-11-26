@@ -151,13 +151,17 @@ struct HwGeometryRuntimeInfo {
     AmdGpu::GsScenario mode;
     std::span<const u32> vs_copy;
     u64 vs_copy_hash;
+    /// Stream-out (transform feedback) of stream 0: enabled buffers and vertex strides in bytes.
+    u32 xfb_buffer_mask;
+    std::array<u16, 4> xfb_strides;
 
     bool operator==(const HwGeometryRuntimeInfo& other) const {
         return num_outputs == other.num_outputs && outputs == other.outputs &&
                num_invocations == other.num_invocations &&
                output_vertices == other.output_vertices && in_primitive == other.in_primitive &&
                std::ranges::equal(out_primitive, other.out_primitive) &&
-               vs_copy_hash == other.vs_copy_hash;
+               vs_copy_hash == other.vs_copy_hash && xfb_buffer_mask == other.xfb_buffer_mask &&
+               xfb_strides == other.xfb_strides;
     }
 };
 
@@ -241,6 +245,9 @@ struct HwComputeRuntimeInfo {
  * It may potentially differ with the same shader module so must be checked.
  * It's also possible to store any other custom information that needs to be part of shader key.
  */
+// Keeps the RuntimeInfo union (serialized raw into the pipeline cache) the same size.
+static_assert(sizeof(HwGeometryRuntimeInfo) <= sizeof(HwFragmentRuntimeInfo));
+
 struct RuntimeInfo {
     SwStage sw_stage;
     HwStage hw_stage;

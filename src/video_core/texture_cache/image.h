@@ -84,7 +84,8 @@ public:
 
 struct Image : public Common::LRUNode<> {
     explicit Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime,
-                   Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info);
+                   Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info,
+                   u32 scale = 1);
     ~Image();
 
     Image(const Image&) = delete;
@@ -99,6 +100,20 @@ struct Image : public Common::LRUNode<> {
 
     vk::Image GetImage() const {
         return backing->image.image;
+    }
+
+    bool IsScaled() const {
+        return scale > 1;
+    }
+
+    /// Width of the host image at the given mip. Guest-facing info.size stays native.
+    u32 HostWidth(u32 mip = 0) const {
+        return std::max((info.size.width * scale) >> mip, 1u);
+    }
+
+    /// Height of the host image at the given mip. Guest-facing info.size stays native.
+    u32 HostHeight(u32 mip = 0) const {
+        return std::max((info.size.height * scale) >> mip, 1u);
     }
 
     bool IsUntracked() {
@@ -142,6 +157,7 @@ public:
     Common::SlotVector<ImageView>* slot_image_views;
     std::mutex mutex;
     ImageInfo info;
+    u32 scale = 1; ///< Host resolution multiplier, only ever > 1 for 2D render targets.
     vk::ImageAspectFlags aspect_mask = vk::ImageAspectFlagBits::eColor;
     vk::SampleCountFlags supported_samples = vk::SampleCountFlagBits::e1;
     ImageFlagBits flags = ImageFlagBits::Dirty;
@@ -149,6 +165,14 @@ public:
     VAddr track_addr_end = 0;
     ImageId depth_id{};
     u64 depth_uid{};
+    /// Bumped whenever the image is transitioned for a write access (attachment, transfer,
+    /// shader or memory write). Used to detect that derived copies may be stale.
+    u64 write_tick{};
+    /// Unregistered R8 color image holding a copy of this depth image's stencil aspect, used
+    /// when a shader reads the stencil plane through a float-class (e.g. R8 Unorm) T#.
+    ImageId stencil_color_id{};
+    /// Value of write_tick when stencil_color_id was last filled (~0 = never).
+    u64 stencil_color_tick = ~0ULL;
 
     vk::ImageUsageFlags usage_flags;
     vk::FormatFeatureFlags2 format_features;

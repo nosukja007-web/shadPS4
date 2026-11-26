@@ -211,6 +211,8 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     GraphicsPipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
 
+    runtime_infos[static_cast<u32>(Shader::SwStage::Geometry)].hw.gs.xfb_buffer_mask = 0;
+    runtime_infos[static_cast<u32>(Shader::SwStage::Geometry)].hw.gs.xfb_strides = {};
     for (int stage_idx = 0; stage_idx < MaxShaderStages; ++stage_idx) {
         const auto& hash = graphics_key.stage_hashes[stage_idx];
         if (!hash) {
@@ -289,6 +291,13 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         } else {
             module = CompileSPV(spv, instance.GetDevice());
         }
+    }
+    if (stage == static_cast<size_t>(Shader::SwStage::Geometry)) {
+        // The pipeline constructor reads the stream-out setup from runtime_infos, which is
+        // otherwise only filled when stages are compiled at runtime.
+        auto& gs = runtime_infos[stage].hw.gs;
+        gs.xfb_buffer_mask = spec.runtime_info.hw.gs.xfb_buffer_mask;
+        gs.xfb_strides = spec.runtime_info.hw.gs.xfb_strides;
     }
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
 

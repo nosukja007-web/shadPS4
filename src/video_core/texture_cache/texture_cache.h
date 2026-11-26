@@ -150,6 +150,12 @@ public:
     /// Links the stencil plane of a depth surface to its depth image.
     void AssociateStencil(ImageId depth_id, const ImageInfo& depth_info);
 
+    /// Returns an R8 color image holding a copy of the stencil aspect of depth image depth_id,
+    /// refreshing the copy if the depth image may have been written since the last copy.
+    /// Used when a shader reads the stencil plane through a float-class T#, as Vulkan only
+    /// allows the stencil aspect to be read with an unsigned integer sampled type.
+    [[nodiscard]] ImageId GetStencilColorCopy(ImageId depth_id);
+
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
         Image& image = slot_images[image_id];
@@ -170,6 +176,13 @@ public:
 
     /// Creates a new image with provided image info and copies subresources from image_id
     [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id);
+
+    /// Replaces image_id with a copy whose host resolution scale is new_scale.
+    [[nodiscard]] ImageId RescaleImage(ImageId image_id, u32 new_scale);
+
+    /// Rescales a render pass attachment to scale when its layout allows it, so that all
+    /// attachments of a pass share one scale. Returns the (possibly new) image id.
+    [[nodiscard]] ImageId MatchTargetScale(ImageId image_id, u32 scale);
 
     /// Reuploads image contents.
     void RefreshImage(Image& image);
@@ -426,6 +439,8 @@ private:
     const bool readback_linear_images;
     std::mutex download_images_mutex;
     absl::flat_hash_map<VAddr, MetaDataInfo> surface_metas;
+    /// Guest addresses written as storage images; these are never upscaled.
+    absl::flat_hash_set<VAddr> unscalable_addresses;
 };
 DECLARE_ENUM_FLAG_OPERATORS(TextureCache::DownloadMemoryFlags)
 

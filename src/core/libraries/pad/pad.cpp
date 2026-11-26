@@ -13,6 +13,7 @@
 #include "pad.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <optional>
 
@@ -393,6 +394,25 @@ int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
         pData[i].leftStick.y = states[i].axes[static_cast<int>(Input::Axis::LeftY)];
         pData[i].rightStick.x = states[i].axes[static_cast<int>(Input::Axis::RightX)];
         pData[i].rightStick.y = states[i].axes[static_cast<int>(Input::Axis::RightY)];
+        {
+            // Report a stick at rest as 127 rather than 128. Some games (Nioh's map cursor) read the
+            // stick with no deadzone around a centre of ~127.5 and treat 128 as a constant small
+            // down-right push. SHADPS4_STICK_CENTER (0-255) overrides the resting value.
+            static const int stick_center = [] {
+                if (const char* env = std::getenv("SHADPS4_STICK_CENTER"); env && env[0]) {
+                    return std::clamp(std::atoi(env), 0, 255);
+                }
+                return 127;
+            }();
+            if (stick_center != 128) {
+                for (u8* v : {&pData[i].leftStick.x, &pData[i].leftStick.y, &pData[i].rightStick.x,
+                              &pData[i].rightStick.y}) {
+                    if (*v == 128) {
+                        *v = static_cast<u8>(stick_center);
+                    }
+                }
+            }
+        }
         pData[i].analogButtons.l2 = states[i].axes[static_cast<int>(Input::Axis::TriggerLeft)];
         pData[i].analogButtons.r2 = states[i].axes[static_cast<int>(Input::Axis::TriggerRight)];
         pData[i].acceleration.x = states[i].acceleration.x * 0.098;

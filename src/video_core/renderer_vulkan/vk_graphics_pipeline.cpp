@@ -9,6 +9,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "shader_recompiler/frontend/copy_shader.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -37,6 +38,15 @@ GraphicsPipeline::GraphicsPipeline(
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_} {
     if (fetch_shader_) {
         fetch_shader = *fetch_shader_;
+    }
+    if (infos[u32(Shader::SwStage::Geometry)]) {
+        const auto& gs = runtime_infos[u32(Shader::SwStage::Geometry)].hw.gs;
+        xfb_buffer_mask = gs.xfb_buffer_mask;
+        xfb_strides = gs.xfb_strides;
+    }
+    if (xfb_buffer_mask) {
+        Shader::XfbTrace(fmt::format("create xfb pipeline begin (gs stage hash {:#x})",
+                                     key.stage_hashes[u32(Shader::SwStage::Geometry)]));
     }
 
     const vk::Device device = instance.GetDevice();
@@ -419,6 +429,9 @@ GraphicsPipeline::GraphicsPipeline(
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
+    if (xfb_buffer_mask) {
+        Shader::XfbTrace("create xfb pipeline end");
+    }
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
 }
 
