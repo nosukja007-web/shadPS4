@@ -122,6 +122,7 @@ private:
     u8 m_next_touch_id{1};
     u64 m_touch_down_timestamp{};
     u64 m_last_orientation_update{};
+    float m_gyro_bias[3] = {0.0f, 0.0f, 0.0f};
     u64 m_last_queue_push{};
     Libraries::Pad::OrbisPadButtonDataOffset m_last_queue_buttons{};
     Colour colour;

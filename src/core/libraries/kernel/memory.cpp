@@ -441,6 +441,12 @@ s32 PS4_SYSV_ABI sceKernelMtypeprotect(const void* addr, u64 size, s32 mtype, s3
     }
 
     Core::MemoryManager* memory_manager = Core::Memory::Instance();
+    if (!memory_manager->IsValidMapping(aligned_addr, aligned_size)) {
+        // e.g. a NULL pointer from a failed allocation: report an error instead of asserting.
+        LOG_ERROR(Kernel_Vmm, "Invalid range addr = {:#x}, size = {:#x}", aligned_addr,
+                  aligned_size);
+        return ORBIS_KERNEL_ERROR_EINVAL;
+    }
     Core::MemoryProt protection_flags = static_cast<Core::MemoryProt>(prot);
 
     s32 result = memory_manager->Protect(aligned_addr, aligned_size, protection_flags);
